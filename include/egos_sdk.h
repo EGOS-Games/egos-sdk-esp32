@@ -282,6 +282,56 @@ bool egos_is_connected(void);
  */
 void egos_indicate_input(void);
 
+/* --------------------------------------------------------------------------
+ * Per-device persisted settings
+ *
+ * For anything a module must remember per device across reboots: a motor's
+ * direction inversion and ramp time, a servo's pulse limits, a sensor's
+ * calibration.
+ *
+ * Stored as opaque blobs keyed by device id. The SDK deliberately does not
+ * define the shapes - a motor's settings belong to the module that has motors,
+ * and putting them here would mean an SDK change for every new device type.
+ * The module owns the struct and its schema version; the SDK owns persistence.
+ *
+ * Because the SDK cannot know whether a blob written by an earlier firmware
+ * still matches the current struct, callers should carry a version field and
+ * check it:
+ *
+ *     motor_cfg_t cfg;
+ *     if (egos_settings_load("motor1", &cfg, sizeof(cfg)) != ESP_OK ||
+ *         cfg.version != MOTOR_CFG_VERSION) {
+ *         cfg = motor_cfg_defaults();
+ *         egos_settings_save("motor1", &cfg, sizeof(cfg));
+ *     }
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Persist a device's settings.
+ *
+ * @param device_id  Device id, as registered and as the controller addresses it
+ * @param data       Settings struct to store
+ * @param len        sizeof that struct
+ * @return ESP_OK on success
+ */
+esp_err_t egos_settings_save(const char *device_id, const void *data, size_t len);
+
+/**
+ * Load a device's settings.
+ *
+ * @return ESP_OK on success; ESP_ERR_NVS_NOT_FOUND if never saved;
+ *         ESP_ERR_INVALID_SIZE if the stored blob is a different size to len,
+ *         which means the struct changed shape and the caller should fall back
+ *         to defaults rather than trust the contents
+ */
+esp_err_t egos_settings_load(const char *device_id, void *data, size_t len);
+
+/** Erase one device's settings. Succeeds if there were none. */
+esp_err_t egos_settings_erase(const char *device_id);
+
+/** Erase every device's settings. Intended for a factory reset. */
+esp_err_t egos_settings_erase_all(void);
+
 #ifdef __cplusplus
 }
 #endif
