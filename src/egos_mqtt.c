@@ -150,10 +150,36 @@ static void handle_credentials_set(const char *data, int data_len)
     cJSON *password = cJSON_GetObjectItem(json, "password");
 
     if (cJSON_IsString(ssid) && cJSON_IsString(password)) {
+        /* The controller re-publishes its current credentials on EVERY module
+         * registration, so this arrives on every connect - not just when the
+         * credentials have actually changed. Saving and rebooting
+         * unconditionally therefore produces an endless reboot loop:
+         *
+         *   boot -> connect -> register -> controller pushes -> save ->
+         *   reboot -> ...
+         *
+         * and the module never becomes usable. Only act when something differs. */
+        char cur_ssid[33] = {0};
+        char cur_pass[65] = {0};
+        bool unchanged = false;
+
+        if (egos_nvs_load_wifi_creds(cur_ssid, sizeof(cur_ssid),
+                                     cur_pass, sizeof(cur_pass)) == ESP_OK) {
+            unchanged = (strcmp(cur_ssid, ssid->valuestring) == 0) &&
+                        (strcmp(cur_pass, password->valuestring) == 0);
+        }
+
+        if (unchanged) {
+            ESP_LOGI(TAG, "Received credentials are identical to stored credentials - ignoring");
+            cJSON_Delete(json);
+            return;
+        }
+
         ESP_LOGI(TAG, "Received new WiFi credentials (SSID: %s)", ssid->valuestring);
         egos_nvs_save_wifi_creds(ssid->valuestring, password->valuestring);
         cJSON_Delete(json);
 
+        egos_led_update(EGOS_LED_CRED_PROVISIONING);
         ESP_LOGI(TAG, "Rebooting to apply new credentials...");
         vTaskDelay(pdMS_TO_TICKS(500));
         esp_restart();
