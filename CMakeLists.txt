@@ -15,6 +15,7 @@ set(srcs
     "src/egos_nvs.c"
     "src/egos_wifi.c"
     "src/egos_mqtt.c"
+    "src/egos_discovery.c"
     "src/egos_connection.c"
     "src/egos_ethernet.c"   # empty unless CONFIG_EGOS_ETHERNET_ENABLED
     "src/egos_led.c"        # empty unless CONFIG_EGOS_STATUS_LED_ENABLED

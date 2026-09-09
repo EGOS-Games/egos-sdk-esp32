@@ -177,6 +177,43 @@ bool egos_wifi_get_ip(char *ip_str, size_t len);
 bool egos_wifi_get_gateway_ip(char *ip_str, size_t len);
 
 /* --------------------------------------------------------------------------
+ * Broker Discovery (egos_discovery.c)
+ * -------------------------------------------------------------------------- */
+
+/** Which step of the discovery cascade produced the broker address */
+typedef enum {
+    EGOS_DISCOVERY_NONE,
+    EGOS_DISCOVERY_CONFIGURED,   /**< Explicit broker_ip from the caller */
+    EGOS_DISCOVERY_CACHED,       /**< IP cached in NVS from a previous success */
+    EGOS_DISCOVERY_GATEWAY,      /**< Gateway on the default EGOS network */
+    EGOS_DISCOVERY_MDNS,         /**< mDNS lookup of the configured hostname */
+    EGOS_DISCOVERY_SCAN,         /**< Found by sweeping the local /24 */
+} egos_discovery_source_t;
+
+/**
+ * Find a reachable broker.
+ *
+ * Every candidate except an explicitly configured one is proved reachable with
+ * a TCP connect before being returned, and a candidate that works is cached in
+ * NVS so the next boot skips straight to it.
+ *
+ * @param cred_source  Which WiFi credentials are in use; the gateway shortcut
+ *                     only applies on the default EGOS network
+ * @param ip_buf       Receives the broker IP (at least 16 bytes)
+ * @param source       Out: which step succeeded (may be NULL)
+ * @return true if a reachable broker was found
+ */
+bool egos_discovery_resolve(egos_cred_source_t cred_source,
+                            char *ip_buf, size_t buf_len,
+                            egos_discovery_source_t *source);
+
+bool egos_discovery_load_stored_ip(char *ip_buf, size_t buf_len);
+bool egos_discovery_save_ip(const char *ip);
+bool egos_discovery_clear_ip(void);
+bool egos_discovery_check_port(const char *ip, uint16_t port, int timeout_ms);
+bool egos_discovery_scan_subnet(uint16_t port, char *ip_buf, size_t buf_len);
+
+/* --------------------------------------------------------------------------
  * MQTT Module (egos_mqtt.c)
  * -------------------------------------------------------------------------- */
 

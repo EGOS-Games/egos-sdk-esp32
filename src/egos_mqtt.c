@@ -485,48 +485,33 @@ esp_err_t egos_mqtt_publish_state(const char *device_id, const char *state_json)
 esp_err_t egos_mqtt_resolve_broker(egos_cred_source_t cred_source,
                                     char *uri_buf, size_t uri_len)
 {
-    /* 1. Direct IP from config */
-    if (egos_g_config.mqtt.broker_ip) {
-        snprintf(uri_buf, uri_len, "mqtt://%s:%d",
-                 egos_g_config.mqtt.broker_ip, egos_g_config.mqtt.broker_port);
-        ESP_LOGI(TAG, "Using configured broker IP: %s", uri_buf);
+    /* Discovery lives in egos_discovery.c: cached IP, gateway, mDNS and a
+     * subnet sweep, each proved reachable with a TCP probe before use, and the
+     * winner cached in NVS for the next boot. */
+    char ip[16];
+    egos_discovery_source_t source = EGOS_DISCOVERY_NONE;
+
+    if (egos_discovery_resolve(cred_source, ip, sizeof(ip), &source)) {
+        snprintf(uri_buf, uri_len, "mqtt://%s:%d", ip,
+                 egos_g_config.mqtt.broker_port);
+
+        static const char *const source_name[] = {
+            [EGOS_DISCOVERY_NONE]       = "none",
+            [EGOS_DISCOVERY_CONFIGURED] = "configured",
+            [EGOS_DISCOVERY_CACHED]     = "cached",
+            [EGOS_DISCOVERY_GATEWAY]    = "gateway",
+            [EGOS_DISCOVERY_MDNS]       = "mDNS",
+            [EGOS_DISCOVERY_SCAN]       = "subnet scan",
+        };
+        ESP_LOGI(TAG, "Broker %s (via %s)", uri_buf, source_name[source]);
         return ESP_OK;
     }
 
-    /* 2. Gateway IP when on default EGOS WiFi (controller is the gateway) */
-    if (cred_source == EGOS_CRED_DEFAULT) {
-        char gw_ip[16];
-        if (egos_wifi_get_gateway_ip(gw_ip, sizeof(gw_ip))) {
-            snprintf(uri_buf, uri_len, "mqtt://%s:%d", gw_ip,
-                     egos_g_config.mqtt.broker_port);
-            ESP_LOGI(TAG, "Using gateway IP as broker (EGOS network): %s", uri_buf);
-            return ESP_OK;
-        }
-    }
-
-    /* 3. mDNS resolution */
-    const char *hostname = egos_g_config.mqtt.broker_hostname;
-    /* Strip .local suffix for mdns_query_a (it adds .local internally) */
-    char mdns_host[64];
-    strncpy(mdns_host, hostname, sizeof(mdns_host) - 1);
-    mdns_host[sizeof(mdns_host) - 1] = '\0';
-    char *local_suffix = strstr(mdns_host, ".local");
-    if (local_suffix) {
-        *local_suffix = '\0';
-    }
-
-    esp_ip4_addr_t addr;
-    esp_err_t ret = mdns_query_a(mdns_host, 5000, &addr);
-    if (ret == ESP_OK) {
-        snprintf(uri_buf, uri_len, "mqtt://" IPSTR ":%d",
-                 IP2STR(&addr), egos_g_config.mqtt.broker_port);
-        ESP_LOGI(TAG, "Resolved broker via mDNS: %s", uri_buf);
-        return ESP_OK;
-    }
-
-    /* 4. Fallback to hostname as-is */
-    snprintf(uri_buf, uri_len, "mqtt://%s:%d", hostname,
+    /* Nothing answered. Hand the hostname to the MQTT client unresolved and
+     * let it try - better than refusing to attempt a connection at all. */
+    snprintf(uri_buf, uri_len, "mqtt://%s:%d",
+             egos_g_config.mqtt.broker_hostname,
              egos_g_config.mqtt.broker_port);
-    ESP_LOGW(TAG, "mDNS failed, using hostname fallback: %s", uri_buf);
+    ESP_LOGW(TAG, "Discovery failed, falling back to hostname: %s", uri_buf);
     return ESP_OK;
 }
