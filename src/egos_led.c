@@ -5,6 +5,13 @@
  * Only compiled when CONFIG_EGOS_STATUS_LED_ENABLED is set in Kconfig.
  */
 
+/* sdkconfig.h must be included BEFORE the guard below, otherwise
+ * CONFIG_EGOS_STATUS_LED_ENABLED is undefined when the #ifdef is evaluated and
+ * this file compiles to nothing whatever the configuration says - which is
+ * exactly what used to happen, leaving egos_led_init/egos_led_set_state
+ * undefined at link time. */
+#include "sdkconfig.h"
+
 #ifdef CONFIG_EGOS_STATUS_LED_ENABLED
 
 #include "egos_internal.h"
@@ -20,11 +27,29 @@ static const char *TAG = "egos_led";
 #define LEDC_DUTY_RES       LEDC_TIMER_8_BIT
 #define LEDC_FREQ           5000
 
-/* Timing constants */
-#define BLINK_FAST_MS       150
+/* Timing constants. These match the values the hardware modules use, so a
+ * migrated module blinks at the same cadence operators are used to. */
+#define BLINK_FAST_MS       200
 #define BLINK_MEDIUM_MS     500
 #define PULSE_PERIOD_MS     2000
+#define DOUBLE_BLINK_MS     200
+#define TRIPLE_FLASH_MS     200
+#define INPUT_FLASH_MS      100
 #define FADE_DURATION_MS    2000
+
+/* Colours of the EGOS status-LED language (see egos_led_state_t) */
+#define C_OFF               0,   0,   0
+#define C_RED             255,   0,   0
+#define C_GREEN             0, 255,   0
+#define C_BLUE              0,   0, 255
+#define C_YELLOW          255, 255,   0
+#define C_CYAN              0, 255, 255
+#define C_MAGENTA         255,   0, 255
+#define C_WHITE           255, 255, 255
+#define C_ORANGE          255, 128,   0   /* stored WiFi credentials */
+#define C_DIM_WHITE       128, 128, 128   /* initialising */
+#define C_YELLOW_ORANGE   255, 192,   0   /* MQTT errors */
+#define C_PURPLE          128,   0, 255   /* network switching */
 
 static volatile egos_led_state_t s_state = EGOS_LED_OFF;
 static TaskHandle_t s_task = NULL;
@@ -50,6 +75,32 @@ static void blink(uint8_t r, uint8_t g, uint8_t b, uint32_t interval_ms)
     }
     on = !on;
     vTaskDelay(pdMS_TO_TICKS(interval_ms));
+}
+
+/* Two quick blinks then a gap - used to mark a transition away from a layer
+ * (e.g. Ethernet gave up and WiFi is about to be tried). */
+static void double_blink(uint8_t r, uint8_t g, uint8_t b)
+{
+    for (int i = 0; i < 2; i++) {
+        set_rgb(r, g, b);
+        vTaskDelay(pdMS_TO_TICKS(DOUBLE_BLINK_MS));
+        set_rgb(C_OFF);
+        vTaskDelay(pdMS_TO_TICKS(DOUBLE_BLINK_MS));
+    }
+    vTaskDelay(pdMS_TO_TICKS(DOUBLE_BLINK_MS * 3));
+}
+
+/* Three quick flashes, then hold off. Marks a one-shot event rather than a
+ * steady state, so it settles dark instead of repeating forever. */
+static void triple_flash(uint8_t r, uint8_t g, uint8_t b)
+{
+    for (int i = 0; i < 3; i++) {
+        set_rgb(r, g, b);
+        vTaskDelay(pdMS_TO_TICKS(TRIPLE_FLASH_MS));
+        set_rgb(C_OFF);
+        vTaskDelay(pdMS_TO_TICKS(TRIPLE_FLASH_MS));
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
 }
 
 static void pulse(uint8_t r, uint8_t g, uint8_t b, uint32_t *counter)
@@ -80,54 +131,85 @@ static void led_task(void *pvParameters)
                 break;
 
             case EGOS_LED_INIT:
-                /* White pulse */
-                pulse(128, 128, 128, &pulse_counter);
+                /* Dim white, brief */
+                set_rgb(C_DIM_WHITE);
+                vTaskDelay(pdMS_TO_TICKS(500));
                 break;
 
+            /* ---- Ethernet layer: cyan ---- */
             case EGOS_LED_ETHERNET_CONNECTING:
-                /* Cyan blink */
-                blink(0, 255, 255, BLINK_MEDIUM_MS);
+                blink(C_CYAN, BLINK_MEDIUM_MS);
                 break;
 
+            case EGOS_LED_ETHERNET_CONNECTED:
+                set_rgb(C_CYAN);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                break;
+
+            case EGOS_LED_ETHERNET_FAILED:
+                double_blink(C_CYAN);
+                break;
+
+            /* ---- WiFi layer: yellow on the default network, orange on stored ---- */
             case EGOS_LED_WIFI_CONNECTING_DEFAULT:
-                /* Blue blink */
-                blink(0, 0, 255, BLINK_MEDIUM_MS);
+                blink(C_YELLOW, BLINK_MEDIUM_MS);
                 break;
 
             case EGOS_LED_WIFI_CONNECTING_STORED:
-                /* Cyan blink */
-                blink(0, 200, 255, BLINK_MEDIUM_MS);
+                blink(C_ORANGE, BLINK_MEDIUM_MS);
                 break;
 
+            case EGOS_LED_WIFI_CONNECTED:
+                set_rgb(C_YELLOW);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                break;
+
+            case EGOS_LED_WIFI_FAILED:
+                blink(C_RED, BLINK_FAST_MS);
+                break;
+
+            /* ---- MQTT / application layer: green ---- */
             case EGOS_LED_MQTT_CONNECTING:
-                /* Yellow blink */
-                blink(255, 200, 0, BLINK_MEDIUM_MS);
+                blink(C_GREEN, BLINK_MEDIUM_MS);
+                break;
+
+            case EGOS_LED_MQTT_FAILED:
+                blink(C_YELLOW_ORANGE, BLINK_MEDIUM_MS);
                 break;
 
             case EGOS_LED_CONNECTED_DEFAULT:
-                /* Solid green */
-                set_rgb(0, 255, 0);
+                set_rgb(C_GREEN);
                 vTaskDelay(pdMS_TO_TICKS(500));
                 break;
 
             case EGOS_LED_CONNECTED_STORED:
-                /* Green pulse */
-                pulse(0, 255, 0, &pulse_counter);
+                /* Green breathing, so "which network am I on" is readable at a glance */
+                pulse(C_GREEN, &pulse_counter);
+                break;
+
+            /* ---- Errors ---- */
+            case EGOS_LED_AUTH_ERROR:
+                blink(C_MAGENTA, BLINK_FAST_MS);
                 break;
 
             case EGOS_LED_ERROR:
-                /* Red fast blink */
-                blink(255, 0, 0, BLINK_FAST_MS);
+                blink(C_RED, BLINK_FAST_MS);
+                break;
+
+            /* ---- One-shot events ---- */
+            case EGOS_LED_INPUT_FLASH:
+                set_rgb(C_BLUE);
+                vTaskDelay(pdMS_TO_TICKS(INPUT_FLASH_MS));
+                set_rgb(C_OFF);
+                vTaskDelay(pdMS_TO_TICKS(INPUT_FLASH_MS));
                 break;
 
             case EGOS_LED_CRED_PROVISIONING:
-                /* Purple pulse */
-                pulse(128, 0, 255, &pulse_counter);
+                triple_flash(C_WHITE);
                 break;
 
             case EGOS_LED_NETWORK_SWITCHING:
-                /* Cyan fast blink */
-                blink(0, 255, 255, BLINK_FAST_MS);
+                pulse(C_PURPLE, &pulse_counter);
                 break;
 
             case EGOS_LED_REBOOTING:

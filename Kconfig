@@ -3,10 +3,18 @@ menu "EGOS SDK"
     config EGOS_ETHERNET_ENABLED
         bool "Enable W5500 Ethernet support"
         default n
+        select ETH_USE_SPI_ETHERNET
+        select ETH_SPI_ETHERNET_W5500
         help
             Enable W5500 SPI Ethernet as a network option.
             When enabled, the connection manager tries Ethernet first
             before falling back to WiFi.
+
+            This pulls in the ESP-IDF W5500 SPI driver it depends on, so
+            enabling this option is sufficient on its own. Without those
+            selects, egos_ethernet.c fails to compile with implicit
+            declarations of esp_eth_mac_new_w5500 and esp_eth_phy_new_w5500,
+            and every consumer has to know to set them by hand.
 
     config EGOS_STATUS_LED_ENABLED
         bool "Enable RGB status LED"

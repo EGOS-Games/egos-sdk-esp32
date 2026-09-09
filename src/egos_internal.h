@@ -85,20 +85,42 @@ typedef enum {
     EGOS_CONN_SWITCHING_NETWORK,
 } egos_conn_state_t;
 
-/** LED status states (used even when LED is disabled — connection manager references these) */
+/** LED status states (used even when LED is disabled — connection manager references these)
+ *
+ * These mirror the EGOS status-LED language documented for the hardware modules,
+ * so a module migrated onto this SDK shows exactly what operators already read:
+ *
+ *   Cyan   = Ethernet layer      Yellow = WiFi on the default "egos" network
+ *   Orange = WiFi on stored      Green  = MQTT / application layer
+ *   Purple = network switching   Red / Magenta = errors
+ *   Blue   = input event         White  = system events
+ */
 typedef enum {
     EGOS_LED_OFF,
-    EGOS_LED_INIT,
-    EGOS_LED_ETHERNET_CONNECTING,
-    EGOS_LED_WIFI_CONNECTING_DEFAULT,
-    EGOS_LED_WIFI_CONNECTING_STORED,
-    EGOS_LED_MQTT_CONNECTING,
-    EGOS_LED_CONNECTED_DEFAULT,
-    EGOS_LED_CONNECTED_STORED,
-    EGOS_LED_ERROR,
-    EGOS_LED_CRED_PROVISIONING,
-    EGOS_LED_NETWORK_SWITCHING,
-    EGOS_LED_REBOOTING,
+    EGOS_LED_INIT,                      /**< Dim white, brief         - initialising */
+
+    EGOS_LED_ETHERNET_CONNECTING,       /**< Cyan, medium blink       - trying Ethernet */
+    EGOS_LED_ETHERNET_CONNECTED,        /**< Cyan, solid              - link up, awaiting MQTT */
+    EGOS_LED_ETHERNET_FAILED,           /**< Cyan, double blink       - falling back to WiFi */
+
+    EGOS_LED_WIFI_CONNECTING_DEFAULT,   /**< Yellow, medium blink     - joining "egos" */
+    EGOS_LED_WIFI_CONNECTING_STORED,    /**< Orange, medium blink     - joining stored network */
+    EGOS_LED_WIFI_CONNECTED,            /**< Yellow, solid            - joined, awaiting MQTT */
+    EGOS_LED_WIFI_FAILED,               /**< Red, fast blink          - could not join */
+
+    EGOS_LED_MQTT_CONNECTING,           /**< Green, medium blink      - connecting to broker */
+    EGOS_LED_MQTT_FAILED,               /**< Yellow-orange, blink     - broker unreachable */
+
+    EGOS_LED_CONNECTED_DEFAULT,         /**< Green, solid             - ready, default network */
+    EGOS_LED_CONNECTED_STORED,          /**< Green, breathing         - ready, stored network */
+
+    EGOS_LED_AUTH_ERROR,                /**< Magenta, fast blink      - wrong credentials */
+    EGOS_LED_ERROR,                     /**< Red, fast blink          - general error */
+
+    EGOS_LED_INPUT_FLASH,               /**< Blue, brief flash        - input event (button press) */
+    EGOS_LED_CRED_PROVISIONING,         /**< White, triple flash      - credentials received */
+    EGOS_LED_NETWORK_SWITCHING,         /**< Purple, pulsing          - switching network */
+    EGOS_LED_REBOOTING,                 /**< White, fade out          - about to restart */
 } egos_led_state_t;
 
 /* --------------------------------------------------------------------------

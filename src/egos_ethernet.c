@@ -5,11 +5,19 @@
  * Only compiled when CONFIG_EGOS_ETHERNET_ENABLED is set in Kconfig.
  */
 
+/* sdkconfig.h must be included BEFORE the guard below, otherwise
+ * CONFIG_EGOS_ETHERNET_ENABLED is undefined when the #ifdef is evaluated and
+ * this file compiles to nothing whatever the configuration says - which is
+ * exactly what used to happen, leaving egos_ethernet_init/egos_ethernet_start
+ * undefined at link time. */
+#include "sdkconfig.h"
+
 #ifdef CONFIG_EGOS_ETHERNET_ENABLED
 
 #include "egos_internal.h"
 #include "esp_eth.h"
 #include "esp_eth_mac_spi.h"
+#include "esp_mac.h"      /* esp_read_mac / ESP_MAC_ETH */
 #include "esp_eth_phy.h"
 #include "esp_netif.h"
 #include "esp_event.h"
@@ -138,6 +146,24 @@ esp_err_t egos_ethernet_init(egos_internal_status_cb_t status_cb)
         ESP_LOGE(TAG, "Ethernet driver install failed: %s", esp_err_to_name(ret));
         return ret;
     }
+
+    /* The W5500 has no MAC address of its own, so one must be programmed before
+     * the interface is attached. Without this the netif comes up as
+     * 00:00:00:00:00:00, which no switch will forward and no DHCP server will
+     * answer - Ethernet appears to link up but never obtains an IP. Deriving it
+     * from the chip's efuse base MAC keeps it stable across reboots and unique
+     * per board. */
+    uint8_t eth_mac[6] = {0};
+    ret = esp_read_mac(eth_mac, ESP_MAC_ETH);
+    if (ret == ESP_OK) {
+        ret = esp_eth_ioctl(s_eth_handle, ETH_CMD_S_MAC_ADDR, eth_mac);
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set Ethernet MAC address: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "Ethernet MAC address set to %02x:%02x:%02x:%02x:%02x:%02x",
+             eth_mac[0], eth_mac[1], eth_mac[2], eth_mac[3], eth_mac[4], eth_mac[5]);
 
     /* Attach to TCP/IP stack */
     ret = esp_netif_attach(s_eth_netif, esp_eth_new_netif_glue(s_eth_handle));
