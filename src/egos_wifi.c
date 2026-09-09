@@ -193,7 +193,27 @@ esp_err_t egos_wifi_connect(egos_cred_source_t source, egos_cred_source_t *actua
 
     if (bits & WIFI_CONNECTED_BIT) {
         return ESP_OK;
-    } else if (bits & WIFI_FAIL_BIT) {
+    }
+
+    /* Failed. Stop the driver before returning.
+     *
+     * This is essential, not tidiness. esp_wifi_connect() is only ever called
+     * from the WIFI_EVENT_STA_START handler, and STA_START only fires when the
+     * driver transitions from stopped to started. If a failed attempt leaves
+     * the driver running, the next esp_wifi_start() is a no-op, STA_START never
+     * fires, esp_wifi_connect() is never called - and the attempt silently does
+     * nothing until it times out, reporting no disconnect reason at all.
+     *
+     * Observed on hardware: only the very first connection attempt after boot
+     * did anything. Every retry and every credential-source fallback timed out
+     * with reason 0, including for an SSID that was definitely absent and had
+     * correctly reported 201 on the first try. That made the whole retry and
+     * fallback mechanism inert. */
+    esp_wifi_stop();
+    s_retry_count = 0;
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+
+    if (bits & WIFI_FAIL_BIT) {
         return ESP_FAIL;
     }
 
