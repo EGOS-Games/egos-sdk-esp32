@@ -143,11 +143,17 @@ typedef struct {
 #endif
 
 #ifdef CONFIG_EGOS_STATUS_LED_ENABLED
-/** RGB LED pin configuration */
+/**
+ * Status LED pin configuration.
+ *
+ * With CONFIG_EGOS_STATUS_LED_MONO set, the board has a single LED rather
+ * than an RGB one: only red_pin is used and the other two are ignored.
+ * Colour collapses to brightness, so the patterns still carry the state.
+ */
 typedef struct {
-    int red_pin;                    /**< Red channel GPIO */
-    int green_pin;                  /**< Green channel GPIO */
-    int blue_pin;                   /**< Blue channel GPIO */
+    int red_pin;                    /**< Red channel GPIO, or the only GPIO when mono */
+    int green_pin;                  /**< Green channel GPIO. Ignored when mono. */
+    int blue_pin;                   /**< Blue channel GPIO. Ignored when mono. */
 } egos_led_config_t;
 #endif
 

@@ -17,10 +17,29 @@ menu "EGOS SDK"
             and every consumer has to know to set them by hand.
 
     config EGOS_STATUS_LED_ENABLED
-        bool "Enable RGB status LED"
+        bool "Enable status LED"
         default n
         help
-            Enable RGB LED status indicator via LEDC PWM.
-            Shows connection state through color patterns.
+            Enable the LED status indicator via LEDC PWM.
+            Shows connection state through colour and blink patterns.
+
+    config EGOS_STATUS_LED_MONO
+        bool "Status LED is a single colour, not RGB"
+        depends on EGOS_STATUS_LED_ENABLED
+        default n
+        help
+            For boards with one status LED rather than an RGB one.
+
+            Only egos_led_config_t.red_pin is used; green_pin and blue_pin
+            are ignored. Every state and every pattern still works - blink
+            rates, double blinks, triple flashes and the breathing pulse are
+            all carried in timing and brightness rather than colour, so the
+            only thing lost is the colour itself.
+
+            States that differ ONLY by colour become indistinguishable. In
+            the current state table that is the pair "connecting to the egos
+            network" and "connecting to a stored network", which share a
+            blink rate, and the two solid "connected" states, which differ by
+            solid versus breathing and so remain distinct.
 
 endmenu

@@ -70,12 +70,26 @@ static volatile egos_led_state_t s_pending_state = EGOS_LED_OFF;
 
 static void set_rgb(uint8_t r, uint8_t g, uint8_t b)
 {
+#ifdef CONFIG_EGOS_STATUS_LED_MONO
+    /* One LED, so colour collapses to brightness. The brightest component
+     * wins rather than an average: an average would dim pure colours to a
+     * third and make "solid red" look like a fault of its own. Every
+     * pattern above is expressed in timing and brightness, so all of them
+     * survive this unchanged - only the hue is lost. */
+    uint8_t level = r;
+    if (g > level) level = g;
+    if (b > level) level = b;
+
+    ledc_set_duty(LEDC_MODE, LEDC_CH_RED, level);
+    ledc_update_duty(LEDC_MODE, LEDC_CH_RED);
+#else
     ledc_set_duty(LEDC_MODE, LEDC_CH_RED, r);
     ledc_update_duty(LEDC_MODE, LEDC_CH_RED);
     ledc_set_duty(LEDC_MODE, LEDC_CH_GREEN, g);
     ledc_update_duty(LEDC_MODE, LEDC_CH_GREEN);
     ledc_set_duty(LEDC_MODE, LEDC_CH_BLUE, b);
     ledc_update_duty(LEDC_MODE, LEDC_CH_BLUE);
+#endif
 }
 
 static void blink(uint8_t r, uint8_t g, uint8_t b, uint32_t interval_ms)
@@ -267,8 +281,12 @@ esp_err_t egos_led_init(void)
 
     const egos_led_config_t *cfg = &egos_g_config.status_led;
 
+#ifdef CONFIG_EGOS_STATUS_LED_MONO
+    ESP_LOGI(TAG, "Initializing mono status LED (GPIO %d)", cfg->red_pin);
+#else
     ESP_LOGI(TAG, "Initializing RGB LED (R=%d, G=%d, B=%d)",
              cfg->red_pin, cfg->green_pin, cfg->blue_pin);
+#endif
 
     /* Configure LEDC timer */
     ledc_timer_config_t timer_cfg = {
@@ -293,6 +311,7 @@ esp_err_t egos_led_init(void)
     ch_cfg.gpio_num = cfg->red_pin;
     ESP_ERROR_CHECK(ledc_channel_config(&ch_cfg));
 
+#ifndef CONFIG_EGOS_STATUS_LED_MONO
     ch_cfg.channel = LEDC_CH_GREEN;
     ch_cfg.gpio_num = cfg->green_pin;
     ESP_ERROR_CHECK(ledc_channel_config(&ch_cfg));
@@ -300,6 +319,7 @@ esp_err_t egos_led_init(void)
     ch_cfg.channel = LEDC_CH_BLUE;
     ch_cfg.gpio_num = cfg->blue_pin;
     ESP_ERROR_CHECK(ledc_channel_config(&ch_cfg));
+#endif
 
     /* Create LED task */
     BaseType_t ret = xTaskCreate(led_task, "egos_led", 2048, NULL, 3, &s_task);
