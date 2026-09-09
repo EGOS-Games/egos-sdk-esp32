@@ -80,6 +80,20 @@ typedef void (*egos_output_command_cb_t)(const char *device_id, const char *comm
 typedef void (*egos_configuration_cb_t)(const char *device_id, const cJSON *config,
                                         void *user_data);
 
+/** Maximum module-defined topics registerable with egos_subscribe(). */
+#define EGOS_MAX_CUSTOM_TOPICS 4
+
+/**
+ * Called when a message arrives on a module-defined topic registered with
+ * egos_subscribe().
+ *
+ * @param topic_suffix  The suffix registered, e.g. "bringup"
+ * @param payload       NUL-terminated message body (not parsed by the SDK)
+ * @param user_data     User-provided context pointer from egos_config_t
+ */
+typedef void (*egos_message_cb_t)(const char *topic_suffix, const char *payload,
+                                  void *user_data);
+
 /**
  * Called when the module is fully connected (MQTT broker connected, devices registered).
  *
@@ -256,6 +270,42 @@ esp_err_t egos_publish_input(const char *device_id, const char *command, const c
 esp_err_t egos_publish_state(const char *device_id, const char *state_json);
 
 /**
+ * Publish a module-level telemetry payload.
+ *
+ * Publishes to: {moduleId}/system
+ *
+ * For readings that belong to the board rather than to any one device -
+ * board temperature, per-port current, fault flags, uptime. Device-specific
+ * state belongs in egos_publish_state() so the controller can attribute it.
+ *
+ * @param state_json JSON string for the module payload
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not connected
+ */
+esp_err_t egos_publish_system(const char *state_json);
+
+/**
+ * Subscribe to a module-defined topic under {moduleId}/.
+ *
+ * For side channels that are not device traffic - a bring-up console, a
+ * diagnostic trigger. The SDK subscribes on connect and re-subscribes on
+ * every reconnect, and hands the raw payload to the callback without
+ * parsing it.
+ *
+ * Protocol topics are matched first, so registering a suffix that collides
+ * with one (e.g. "output") leaves the protocol behaviour intact and the
+ * callback simply never fires.
+ *
+ * Call before egos_start() where possible; a later call still works and
+ * subscribes immediately if MQTT is already up.
+ *
+ * @param topic_suffix  Suffix after "{moduleId}/", e.g. "bringup" (max 23 chars)
+ * @param cb            Handler for messages on that topic
+ * @return ESP_OK, ESP_ERR_NO_MEM if EGOS_MAX_CUSTOM_TOPICS is exhausted,
+ *         ESP_ERR_INVALID_SIZE if the suffix is too long
+ */
+esp_err_t egos_subscribe(const char *topic_suffix, egos_message_cb_t cb);
+
+/**
  * Get the auto-generated module ID.
  * Format: "{prefix}-{MAC}" where MAC is the 12-char hex of the ESP32 MAC address.
  *
@@ -281,6 +331,36 @@ bool egos_is_connected(void);
  * to guard it.
  */
 void egos_indicate_input(void);
+
+/**
+ * Bring the status LED up early, before egos_start().
+ *
+ * The SDK normally initialises the LED as part of egos_start(). A module
+ * that puts safety-critical hardware into a known state before going near
+ * the network needs the LED working during that window, so it can show a
+ * fault raised by its own bring-up. Calling this first makes that possible;
+ * the SDK's later initialisation becomes a no-op.
+ *
+ * Requires egos_init() to have run, since the pin configuration comes from
+ * the config. Safe to call more than once. No-op when
+ * CONFIG_EGOS_STATUS_LED_ENABLED is off.
+ */
+esp_err_t egos_status_led_begin(void);
+
+/**
+ * Latch or clear a module fault on the status LED.
+ *
+ * While a fault is latched the LED shows the error pattern and connection
+ * state changes underneath are recorded but not displayed, so a board that
+ * has tripped its safety layer cannot show a reassuring green while faulted.
+ * Clearing the fault restores whatever the connection state had become.
+ *
+ * For modules with a safety or fault layer of their own. No-op when
+ * CONFIG_EGOS_STATUS_LED_ENABLED is off, so callers need not guard it.
+ *
+ * @param active true to latch the fault, false to clear it
+ */
+void egos_indicate_fault(bool active);
 
 /* --------------------------------------------------------------------------
  * Per-device persisted settings

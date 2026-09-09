@@ -111,6 +111,26 @@ esp_err_t egos_publish_state(const char *device_id, const char *state_json)
     return egos_mqtt_publish_state(device_id, state_json);
 }
 
+esp_err_t egos_publish_system(const char *state_json)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!state_json) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return egos_mqtt_publish_system(state_json);
+}
+
+esp_err_t egos_subscribe(const char *topic_suffix, egos_message_cb_t cb)
+{
+    /* Deliberately does NOT require s_initialized: the module id is only
+     * needed when the subscription is actually issued, which happens on
+     * connect. Registering before egos_init() is therefore legitimate. */
+    return egos_mqtt_subscribe_custom(topic_suffix, cb);
+}
+
 const char *egos_get_module_id(void)
 {
     if (!s_initialized) {
@@ -131,5 +151,23 @@ void egos_indicate_input(void)
 {
 #ifdef CONFIG_EGOS_STATUS_LED_ENABLED
     egos_led_flash_input();
+#endif
+}
+
+esp_err_t egos_status_led_begin(void)
+{
+#ifdef CONFIG_EGOS_STATUS_LED_ENABLED
+    return egos_led_init();
+#else
+    return ESP_OK;
+#endif
+}
+
+void egos_indicate_fault(bool active)
+{
+#ifdef CONFIG_EGOS_STATUS_LED_ENABLED
+    egos_led_set_fault(active);
+#else
+    (void)active;
 #endif
 }

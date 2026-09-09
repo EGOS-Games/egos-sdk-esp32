@@ -226,6 +226,8 @@ bool egos_mqtt_is_connected(void);
 esp_err_t egos_mqtt_publish_input(const char *device_id, const char *command,
                                    const char *params_json);
 esp_err_t egos_mqtt_publish_state(const char *device_id, const char *state_json);
+esp_err_t egos_mqtt_publish_system(const char *state_json);
+esp_err_t egos_mqtt_subscribe_custom(const char *suffix, egos_message_cb_t cb);
 esp_err_t egos_mqtt_resolve_broker(egos_cred_source_t cred_source,
                                     char *uri_buf, size_t uri_len);
 
@@ -256,6 +258,7 @@ void egos_ethernet_cleanup(void);
 #ifdef CONFIG_EGOS_STATUS_LED_ENABLED
 esp_err_t egos_led_init(void);
 void egos_led_set_state(egos_led_state_t state);
+void egos_led_set_fault(bool active);
 void egos_led_flash_input(void);
 void egos_led_cleanup(void);
 #endif

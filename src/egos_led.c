@@ -59,6 +59,15 @@ static bool s_initialized = false;
  * blocked waiting for the flash to finish. */
 static volatile bool s_flash_request = false;
 
+/* Module-asserted fault latch. While set, connection-state updates are
+ * recorded but not shown: a board that has tripped its safety layer must
+ * keep saying so, and a green "connected" LED over a faulted board is a
+ * genuinely dangerous thing to display. The pending state is replayed when
+ * the fault clears, so the LED does not have to wait for the next
+ * connection change to become truthful again. */
+static volatile bool s_fault_active = false;
+static volatile egos_led_state_t s_pending_state = EGOS_LED_OFF;
+
 static void set_rgb(uint8_t r, uint8_t g, uint8_t b)
 {
     ledc_set_duty(LEDC_MODE, LEDC_CH_RED, r);
@@ -247,6 +256,15 @@ static void led_task(void *pvParameters)
 
 esp_err_t egos_led_init(void)
 {
+    /* Idempotent: modules with safety-critical hardware bring the LED up
+     * themselves before touching that hardware, and the SDK's own call
+     * during connection start then has nothing to do. Without this the
+     * second call would configure LEDC twice and leave a second, orphaned
+     * LED task fighting the first for the same pins. */
+    if (s_initialized) {
+        return ESP_OK;
+    }
+
     const egos_led_config_t *cfg = &egos_g_config.status_led;
 
     ESP_LOGI(TAG, "Initializing RGB LED (R=%d, G=%d, B=%d)",
@@ -298,7 +316,27 @@ esp_err_t egos_led_init(void)
 void egos_led_set_state(egos_led_state_t state)
 {
     if (!s_initialized) return;
+    if (s_fault_active) {
+        s_pending_state = state;   /* remembered, shown when the fault clears */
+        return;
+    }
     s_state = state;
+}
+
+void egos_led_set_fault(bool active)
+{
+    if (!s_initialized) return;
+
+    if (active) {
+        if (!s_fault_active) {
+            s_pending_state = s_state;
+            s_fault_active = true;
+        }
+        s_state = EGOS_LED_ERROR;
+    } else if (s_fault_active) {
+        s_fault_active = false;
+        s_state = s_pending_state;
+    }
 }
 
 void egos_led_flash_input(void)

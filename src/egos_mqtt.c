@@ -10,6 +10,7 @@
 #include "esp_timer.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>   /* malloc/free for incoming payloads */
 
 static const char *TAG = "egos_mqtt";
 
@@ -18,6 +19,17 @@ static egos_internal_status_cb_t s_status_cb = NULL;
 static egos_internal_timeout_cb_t s_timeout_cb = NULL;
 static volatile bool s_connected = false;
 static esp_timer_handle_t s_timeout_timer = NULL;
+
+/* Module-defined topics under "{moduleId}/". Small and fixed: a module
+ * that needs more than a handful of side channels is describing devices,
+ * and those belong in the device table where the controller can see them. */
+typedef struct {
+    char                suffix[24];
+    egos_message_cb_t   cb;
+} custom_sub_t;
+
+static custom_sub_t s_custom_subs[EGOS_MAX_CUSTOM_TOPICS];
+static uint8_t      s_custom_sub_count = 0;
 
 /* --------------------------------------------------------------------------
  * Topic Helpers
@@ -131,7 +143,16 @@ static void subscribe_topics(void)
     snprintf(topic, sizeof(topic), "%s/credentials/reset", egos_g_module_id);
     esp_mqtt_client_subscribe(s_client, topic, 1);
 
-    ESP_LOGI(TAG, "Subscribed to command topics");
+    /* Re-subscribed on every reconnect, not just the first connect, so a
+     * module keeps its side channels across a broker restart. */
+    for (uint8_t i = 0; i < s_custom_sub_count; i++) {
+        snprintf(topic, sizeof(topic), "%s/%s", egos_g_module_id,
+                 s_custom_subs[i].suffix);
+        esp_mqtt_client_subscribe(s_client, topic, 1);
+    }
+
+    ESP_LOGI(TAG, "Subscribed to command topics (%u module-defined)",
+             (unsigned)s_custom_sub_count);
 }
 
 /* --------------------------------------------------------------------------
@@ -269,6 +290,29 @@ static void handle_mqtt_data(esp_mqtt_event_handle_t event)
         handle_configuration_set(topic_buf, topic_len, event->data, event->data_len);
     } else if (topic_ends_with(topic_buf, topic_len, "/output")) {
         handle_output_command(topic_buf, topic_len, event->data, event->data_len);
+    } else {
+        /* Module-defined topic. Checked last so a module can never shadow
+         * the protocol topics above by registering a colliding suffix. */
+        for (uint8_t i = 0; i < s_custom_sub_count; i++) {
+            char want[32];
+            snprintf(want, sizeof(want), "/%s", s_custom_subs[i].suffix);
+            if (!topic_ends_with(topic_buf, topic_len, want)) {
+                continue;
+            }
+            /* event->data is not NUL terminated and may be a partial
+             * fragment of a large message; copy the part we have. */
+            char *payload = malloc(event->data_len + 1);
+            if (payload == NULL) {
+                ESP_LOGE(TAG, "Out of memory handling %s", s_custom_subs[i].suffix);
+                return;
+            }
+            memcpy(payload, event->data, event->data_len);
+            payload[event->data_len] = '\0';
+            s_custom_subs[i].cb(s_custom_subs[i].suffix, payload,
+                                egos_g_config.user_data);
+            free(payload);
+            return;
+        }
     }
 }
 
@@ -480,6 +524,50 @@ esp_err_t egos_mqtt_publish_state(const char *device_id, const char *state_json)
 
     int msg_id = esp_mqtt_client_publish(s_client, topic, state_json, 0, 0, 0);
     return (msg_id >= 0) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t egos_mqtt_publish_system(const char *state_json)
+{
+    if (!s_connected || !s_client) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char topic[128];
+    snprintf(topic, sizeof(topic), "%s/system", egos_g_module_id);
+
+    int msg_id = esp_mqtt_client_publish(s_client, topic, state_json, 0, 0, 0);
+    return (msg_id >= 0) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t egos_mqtt_subscribe_custom(const char *suffix, egos_message_cb_t cb)
+{
+    if (suffix == NULL || suffix[0] == '\0' || cb == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (strlen(suffix) >= sizeof(s_custom_subs[0].suffix)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (s_custom_sub_count >= EGOS_MAX_CUSTOM_TOPICS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    strncpy(s_custom_subs[s_custom_sub_count].suffix, suffix,
+            sizeof(s_custom_subs[0].suffix) - 1);
+    s_custom_subs[s_custom_sub_count].suffix[sizeof(s_custom_subs[0].suffix) - 1] = '\0';
+    s_custom_subs[s_custom_sub_count].cb = cb;
+    s_custom_sub_count++;
+
+    /* If MQTT is already up, subscribe now; otherwise subscribe_topics()
+     * will pick it up on connect. Registering before egos_start() is the
+     * expected case, but a late registration must not be silently inert. */
+    if (s_connected && s_client) {
+        char topic[128];
+        snprintf(topic, sizeof(topic), "%s/%s", egos_g_module_id, suffix);
+        esp_mqtt_client_subscribe(s_client, topic, 1);
+    }
+
+    ESP_LOGI(TAG, "Registered module topic %s/%s", egos_g_module_id, suffix);
+    return ESP_OK;
 }
 
 esp_err_t egos_mqtt_resolve_broker(egos_cred_source_t cred_source,
