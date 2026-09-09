@@ -329,7 +329,11 @@ esp_err_t egos_led_init(void)
     }
 
     s_initialized = true;
+#ifdef CONFIG_EGOS_STATUS_LED_MONO
+    ESP_LOGI(TAG, "Mono status LED initialized");
+#else
     ESP_LOGI(TAG, "RGB LED initialized");
+#endif
     return ESP_OK;
 }
 
