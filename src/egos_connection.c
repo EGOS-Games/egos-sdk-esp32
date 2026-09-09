@@ -23,6 +23,12 @@ static const char *TAG = "egos_conn";
 static volatile egos_conn_state_t s_conn_state = EGOS_CONN_INIT;
 static volatile bool s_wifi_connected = false;
 static volatile bool s_mqtt_connected = false;
+/* Whether MQTT has ever completed a connection since the current attempt was
+ * started. Without this, EGOS_CONN_CONNECTED reads "not connected yet" as
+ * "connection lost" on its very first tick and fires a second connect that
+ * races the first - producing two brokers connections, two device
+ * registrations and two on_connected callbacks per boot. */
+static volatile bool s_mqtt_established = false;
 static volatile bool s_mqtt_switch_requested = false;
 static volatile uint8_t s_mqtt_timeouts = 0;
 static egos_cred_source_t s_cred_source = EGOS_CRED_DEFAULT;
@@ -86,6 +92,7 @@ static void mqtt_status_cb(bool connected)
 {
     s_mqtt_connected = connected;
     if (connected) {
+        s_mqtt_established = true;
         s_mqtt_timeouts = 0;
         s_mqtt_switch_requested = false;
         ESP_LOGI(TAG, "MQTT connected");
@@ -325,6 +332,10 @@ static void connection_manager_task(void *pvParameters)
             ESP_LOGI(TAG, "Network ready, connecting MQTT...");
             egos_led_update(EGOS_LED_MQTT_CONNECTING);
 
+            /* Fresh attempt: nothing established yet, so CONNECTED must not
+             * mistake "no reply yet" for "connection lost". */
+            s_mqtt_established = false;
+
             if (try_mqtt_connect() != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to start MQTT connection");
                 egos_led_update(EGOS_LED_ERROR);
@@ -346,13 +357,23 @@ static void connection_manager_task(void *pvParameters)
                 break;
             }
 
-            /* If MQTT disconnected but network still up, reconnect */
-            if (!s_mqtt_connected && (s_wifi_connected
+            /* If MQTT dropped after having been connected, and the network is
+             * still up, reconnect.
+             *
+             * s_mqtt_established is what stops this firing on the very first
+             * tick after NETWORK_READY started a connection: at that point the
+             * broker simply has not replied yet, which is not the same as a
+             * lost connection. Without it a second connect raced the first and
+             * the module registered its devices twice per boot, ~300ms apart,
+             * and called on_connected twice. egos_mqtt has its own connect
+             * timeout, so waiting here costs nothing. */
+            if (!s_mqtt_connected && s_mqtt_established && (s_wifi_connected
 #ifdef CONFIG_EGOS_ETHERNET_ENABLED
                 || s_ethernet_connected
 #endif
             )) {
                 ESP_LOGI(TAG, "MQTT lost, reconnecting...");
+                s_mqtt_established = false;
                 egos_led_update(EGOS_LED_MQTT_CONNECTING);
                 try_mqtt_connect();
             }
