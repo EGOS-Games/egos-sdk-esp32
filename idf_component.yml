@@ -4,9 +4,9 @@ description: >-
   Handles WiFi, Ethernet, MQTT, device registration and connection management,
   including credential provisioning and automatic fallback to the default
   network when a provisioned network is not in range.
-url: https://github.com/EGOS-Games/egos-sdk-esp32s3
-repository: https://github.com/EGOS-Games/egos-sdk-esp32s3.git
-issues: https://github.com/EGOS-Games/egos-sdk-esp32s3/issues
+url: https://github.com/EGOS-Games/egos-sdk-esp32
+repository: https://github.com/EGOS-Games/egos-sdk-esp32.git
+issues: https://github.com/EGOS-Games/egos-sdk-esp32/issues
 
 # No "targets" key on purpose: the component contains no target-specific code,
 # and the fleet already spans ESP32-S3 modules and a classic ESP32 (DMX) board.
