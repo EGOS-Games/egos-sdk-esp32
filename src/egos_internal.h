@@ -40,6 +40,41 @@ typedef enum {
     EGOS_CRED_STORED,    /**< Using credentials stored in NVS */
 } egos_cred_source_t;
 
+/* --------------------------------------------------------------------------
+ * WiFi credential fallback tuning
+ *
+ * A module provisioned onto a site network keeps those credentials in NVS. If
+ * that network later disappears, the module must fall back to the default
+ * network so the controller can reach it and push new credentials - otherwise
+ * it retries an absent SSID forever and is unreachable.
+ * -------------------------------------------------------------------------- */
+
+/** IEEE 802.11 reason code: no AP found with the requested SSID. */
+#define EGOS_WIFI_REASON_NO_AP_FOUND 201
+
+/**
+ * Consecutive reason-201 disconnects that end a connect attempt early instead
+ * of running the full max_retry loop. Each attempt performs a full scan, so two
+ * misses are conclusive: the SSID is not in range. Turns a missing network into
+ * a ~5s failure rather than burning the whole connect timeout.
+ */
+#define EGOS_WIFI_NO_AP_FOUND_ABORT_COUNT 2
+
+/**
+ * Failed attempts on the current credential source before switching to the
+ * other one when the SSID was not found. The network is definitively absent,
+ * so switch immediately.
+ */
+#define EGOS_WIFI_SWITCH_AFTER_NO_AP 1
+
+/**
+ * Failed attempts before switching source for any other failure (wrong
+ * password, handshake timeout, AP still booting). Higher than the "no AP"
+ * threshold so a router that is slow to come back after a power cut does not
+ * strand the module on the fallback network.
+ */
+#define EGOS_WIFI_SWITCH_AFTER_OTHER 3
+
 /** Connection manager states */
 typedef enum {
     EGOS_CONN_INIT,
@@ -89,7 +124,31 @@ bool egos_nvs_has_wifi_creds(void);
  * -------------------------------------------------------------------------- */
 
 esp_err_t egos_wifi_init(egos_internal_status_cb_t status_cb);
-esp_err_t egos_wifi_connect(egos_cred_source_t source);
+
+/**
+ * Connect using a specific credential source.
+ *
+ * When EGOS_CRED_STORED is requested but no credentials are stored, this falls
+ * back to the configured defaults. Callers that track a preferred source must
+ * read actual_source to learn what was really used, rather than assuming the
+ * requested source was honoured.
+ *
+ * @param source         Credential source to attempt
+ * @param actual_source  Out: the source actually used (may be NULL)
+ */
+esp_err_t egos_wifi_connect(egos_cred_source_t source, egos_cred_source_t *actual_source);
+
+/**
+ * Reason code from the most recent STA disconnect event.
+ *
+ * Lets the caller tell "the SSID is not in range" (EGOS_WIFI_REASON_NO_AP_FOUND)
+ * apart from "the AP is there but rejected us", so a failed attempt can pick an
+ * appropriate fallback threshold. Cleared at the start of every attempt.
+ *
+ * @return IEEE 802.11 reason code, or 0 if no disconnect occurred this attempt
+ */
+uint8_t egos_wifi_get_last_disconnect_reason(void);
+
 esp_err_t egos_wifi_disconnect(void);
 bool egos_wifi_is_connected(void);
 bool egos_wifi_get_ip(char *ip_str, size_t len);

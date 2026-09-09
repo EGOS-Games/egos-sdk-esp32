@@ -274,11 +274,45 @@ All topics are relative to your module ID.
 The SDK manages connectivity automatically:
 
 1. **Network connection** — Tries Ethernet first (if enabled, 5s timeout), then WiFi
-2. **WiFi credentials** — Tries stored NVS credentials first, falls back to defaults
+2. **WiFi credentials** — Prefers stored NVS credentials, and falls back to the
+   configured defaults if that network cannot be joined (see below)
 3. **Broker discovery** — Direct IP > gateway IP (on EGOS network) > mDNS > hostname
 4. **MQTT connection** — Connects with 10s timeout, auto-reconnects on disconnect
 5. **Network fallback** — After 5 consecutive MQTT timeouts (~50s), switches to alternate network/credentials
 6. **Credential cycling** — WiFi-only: toggles between stored and default. With Ethernet: cycles Ethernet > WiFi(default) > WiFi(stored)
+
+### WiFi Credential Fallback
+
+A module provisioned onto a site network keeps those credentials in NVS. If that
+network later disappears — the module is moved, or the router is replaced — it
+must reach the default network so the controller can push new credentials.
+Otherwise it retries an absent SSID forever and is unreachable.
+
+The credential source is therefore a **sticky preference**, not a fixed rule:
+
+- It starts at **stored**, so a provisioned module always tries its own network first.
+- On a successful connection it becomes whatever actually connected, so a module
+  that has fallen back to the default network keeps preferring it across later
+  drops rather than reverting to a network that is no longer there.
+- On repeated failure it **alternates**, so the module can never end up pinned to
+  a network that has gone away.
+
+How quickly it alternates depends on why the attempt failed:
+
+| Disconnect reason | Attempts before switching |
+| --- | --- |
+| 201 `NO_AP_FOUND` — the SSID is not in range | 1 (conclusive, switch at once) |
+| anything else — wrong password, handshake timeout, AP still booting | 3 |
+
+A missing SSID is also detected early: after two consecutive reason-201
+disconnects the attempt is abandoned rather than running out the full
+`max_retry` loop and connect timeout, so fallback takes roughly five seconds
+instead of tens.
+
+The preference lives in RAM only. A power cycle, or the reboot that follows new
+credentials arriving, deliberately re-tries the stored network first. Stored
+credentials are never erased by a failed connection — they are replaced only by
+`{moduleId}/credentials/set`.
 
 ### WiFi Credential Provisioning
 

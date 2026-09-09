@@ -1,0 +1,26 @@
+version: "0.1.0"
+description: >-
+  Reusable ESP-IDF component for building EGOS hardware modules on ESP32.
+  Handles WiFi, Ethernet, MQTT, device registration and connection management,
+  including credential provisioning and automatic fallback to the default
+  network when a provisioned network is not in range.
+url: https://github.com/EGOS-Games/egos-sdk-esp32s3
+repository: https://github.com/EGOS-Games/egos-sdk-esp32s3.git
+issues: https://github.com/EGOS-Games/egos-sdk-esp32s3/issues
+
+# No "targets" key on purpose: the component contains no target-specific code,
+# and the fleet already spans ESP32-S3 modules and a classic ESP32 (DMX) board.
+# Restricting targets here would block those without cause.
+
+dependencies:
+  # esp_driver_ledc (referenced by CMakeLists when the status LED is enabled)
+  # only exists as a separate component from ESP-IDF v5.2, when the driver
+  # component was split up.
+  idf: ">=5.2"
+
+  # Required by src/egos_mqtt.c for broker discovery via <hostname>.local and
+  # for the MQTT client itself. These are managed components, so they must be
+  # declared here - a plain REQUIRES in CMakeLists.txt cannot pull them, and
+  # without this every consumer has to know to declare them itself.
+  espressif/mdns: "^1.2"
+  espressif/mqtt: "^1.0"

@@ -22,6 +22,11 @@ static volatile bool s_connected = false;
 static int s_retry_count = 0;
 static bool s_mdns_initialized = false;
 static bool s_initialized = false;
+/* Reason from the most recent STA_DISCONNECTED, exposed so the connection
+ * manager can tell "SSID not in range" from "SSID there but rejecting us" */
+static uint8_t s_last_disconnect_reason = 0;
+/* Consecutive reason-201 disconnects within the current connect attempt */
+static uint8_t s_no_ap_found_count = 0;
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                 int32_t event_id, void *event_data)
@@ -31,8 +36,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
         s_connected = false;
+        s_last_disconnect_reason = disconn->reason;
 
-        if (s_retry_count < egos_g_config.wifi.max_retry) {
+        if (disconn->reason == EGOS_WIFI_REASON_NO_AP_FOUND) {
+            s_no_ap_found_count++;
+        }
+
+        if (s_no_ap_found_count >= EGOS_WIFI_NO_AP_FOUND_ABORT_COUNT) {
+            /* Each attempt runs a full scan, so repeated "no AP found" means the
+             * SSID genuinely is not in range. Abandon the attempt now rather
+             * than burning the remaining retries and the caller's timeout, so
+             * the connection manager can try the other credential source. */
+            ESP_LOGE(TAG, "SSID '%s' not found after %d scans - abandoning attempt so a fallback network can be tried",
+                     (const char *)disconn->ssid, s_no_ap_found_count);
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        } else if (s_retry_count < egos_g_config.wifi.max_retry) {
             s_retry_count++;
             ESP_LOGW(TAG, "WiFi disconnected (reason: %d), retry %d/%d",
                      disconn->reason, s_retry_count, egos_g_config.wifi.max_retry);
@@ -105,13 +123,17 @@ esp_err_t egos_wifi_init(egos_internal_status_cb_t status_cb)
     return ESP_OK;
 }
 
-esp_err_t egos_wifi_connect(egos_cred_source_t source)
+esp_err_t egos_wifi_connect(egos_cred_source_t source, egos_cred_source_t *actual_source)
 {
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
 
     s_retry_count = 0;
+    /* Fresh attempt - clear the per-attempt disconnect diagnostics so the
+     * caller reads the reason for THIS attempt, not the previous one */
+    s_last_disconnect_reason = 0;
+    s_no_ap_found_count = 0;
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
 
     wifi_config_t wifi_config = {
@@ -148,6 +170,12 @@ esp_err_t egos_wifi_connect(egos_cred_source_t source)
                 sizeof(wifi_config.sta.password) - 1);
         ESP_LOGI(TAG, "Connecting with default credentials (SSID: %s)",
                  egos_g_config.wifi.ssid);
+    }
+
+    /* Report what was actually used - "source" may have been downgraded above
+     * when STORED was requested but NVS held nothing */
+    if (actual_source != NULL) {
+        *actual_source = source;
     }
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -189,6 +217,11 @@ esp_err_t egos_wifi_disconnect(void)
 bool egos_wifi_is_connected(void)
 {
     return s_connected;
+}
+
+uint8_t egos_wifi_get_last_disconnect_reason(void)
+{
+    return s_last_disconnect_reason;
 }
 
 bool egos_wifi_get_ip(char *ip_str, size_t len)

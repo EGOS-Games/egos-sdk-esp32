@@ -29,6 +29,35 @@ static egos_cred_source_t s_cred_source = EGOS_CRED_DEFAULT;
 static bool s_mqtt_initialized = false;
 static TaskHandle_t s_task_handle = NULL;
 
+/* Which credential source to try next.
+ *
+ * Sticky: starts at STORED so a provisioned module always tries its own network
+ * first, is updated to whatever actually connects, and alternates to the other
+ * source after repeated failures. Because it is updated on success, a module
+ * that has fallen back to the default network keeps preferring it across later
+ * drops rather than reverting to a stored network that is no longer there.
+ * Because it still alternates on failure, the module can never end up pinned to
+ * a network that has gone away.
+ *
+ * RAM only: a power cycle, or the reboot that follows new credentials arriving,
+ * deliberately re-tries the stored network first. */
+static egos_cred_source_t s_preferred_cred_source = EGOS_CRED_STORED;
+
+/* Consecutive failed connect attempts against s_preferred_cred_source */
+static uint8_t s_cred_source_failures = 0;
+
+/* Backoff between WiFi retries, to avoid hammering a busy router. Starts at the
+ * minimum rather than 0 so a retry can never fire on the very next tick. */
+#define EGOS_WIFI_RETRY_BACKOFF_MIN_MS 2000
+#define EGOS_WIFI_RETRY_BACKOFF_MAX_STEPS 3
+static uint32_t s_wifi_retry_backoff_ms = EGOS_WIFI_RETRY_BACKOFF_MIN_MS;
+static uint8_t s_wifi_retry_count = 0;
+
+static const char *cred_source_name(egos_cred_source_t source)
+{
+    return (source == EGOS_CRED_STORED) ? "stored (NVS)" : "default";
+}
+
 #ifdef CONFIG_EGOS_ETHERNET_ENABLED
 static volatile bool s_ethernet_connected = false;
 
@@ -99,6 +128,72 @@ static void ethernet_status_cb(bool connected)
 #endif
 
 /* --------------------------------------------------------------------------
+ * WiFi Connect Helper
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Attempt a WiFi connection using the sticky preferred credential source, and
+ * update that preference from the outcome.
+ *
+ * On success the preference becomes whatever actually connected, so later
+ * reconnects resume on the network that works. On failure the preference
+ * alternates once the source has failed enough times - immediately when the
+ * SSID was not found (conclusive), after more attempts for any other reason so
+ * a router that is slow to come back does not strand the module elsewhere.
+ */
+static esp_err_t wifi_connect_preferred(void)
+{
+    egos_cred_source_t actual = s_preferred_cred_source;
+
+    ESP_LOGI(TAG, "Connecting WiFi (%s credentials)...",
+             cred_source_name(s_preferred_cred_source));
+    egos_led_update(s_preferred_cred_source == EGOS_CRED_STORED
+                    ? EGOS_LED_WIFI_CONNECTING_STORED
+                    : EGOS_LED_WIFI_CONNECTING_DEFAULT);
+
+    esp_err_t ret = egos_wifi_connect(s_preferred_cred_source, &actual);
+
+    if (ret == ESP_OK) {
+        /* Remember what actually worked. egos_wifi_connect() downgrades STORED
+         * to DEFAULT when NVS is empty, so read back what it reports. */
+        s_preferred_cred_source = actual;
+        s_cred_source = actual;
+        s_cred_source_failures = 0;
+        s_wifi_retry_count = 0;
+        s_wifi_retry_backoff_ms = EGOS_WIFI_RETRY_BACKOFF_MIN_MS;
+        return ESP_OK;
+    }
+
+    s_cred_source_failures++;
+
+    uint8_t reason = egos_wifi_get_last_disconnect_reason();
+    uint8_t threshold = (reason == EGOS_WIFI_REASON_NO_AP_FOUND)
+                        ? EGOS_WIFI_SWITCH_AFTER_NO_AP
+                        : EGOS_WIFI_SWITCH_AFTER_OTHER;
+
+    if (s_cred_source_failures >= threshold) {
+        s_preferred_cred_source = (s_preferred_cred_source == EGOS_CRED_STORED)
+                                  ? EGOS_CRED_DEFAULT
+                                  : EGOS_CRED_STORED;
+        s_cred_source_failures = 0;
+        ESP_LOGW(TAG, "Falling back to %s credentials (last disconnect reason: %d)",
+                 cred_source_name(s_preferred_cred_source), reason);
+    } else {
+        ESP_LOGI(TAG, "Retrying %s credentials (%d/%d before switching, reason: %d)",
+                 cred_source_name(s_preferred_cred_source),
+                 s_cred_source_failures, threshold, reason);
+    }
+
+    /* Exponential backoff, capped, to reduce load on a busy router */
+    s_wifi_retry_count++;
+    s_wifi_retry_backoff_ms = EGOS_WIFI_RETRY_BACKOFF_MIN_MS
+        * (s_wifi_retry_count > EGOS_WIFI_RETRY_BACKOFF_MAX_STEPS
+           ? EGOS_WIFI_RETRY_BACKOFF_MAX_STEPS : s_wifi_retry_count);
+
+    return ret;
+}
+
+/* --------------------------------------------------------------------------
  * MQTT Connect Helper
  * -------------------------------------------------------------------------- */
 
@@ -139,6 +234,17 @@ static void connection_manager_task(void *pvParameters)
     while (1) {
         switch (s_conn_state) {
 
+#ifndef CONFIG_EGOS_ETHERNET_ENABLED
+        /* EGOS_CONN_TRYING_ETHERNET is declared unconditionally in the state
+         * enum, but its case body is compiled out when Ethernet support is
+         * disabled. Without this the build fails under -Werror=switch, which
+         * means the component would not compile in its own default
+         * configuration (CONFIG_EGOS_ETHERNET_ENABLED defaults to n).
+         * The state is unreachable here: nothing sets it when Ethernet is off. */
+        case EGOS_CONN_TRYING_ETHERNET:
+            break;
+#endif
+
         case EGOS_CONN_INIT:
             state_timer = 0;
 
@@ -148,17 +254,10 @@ static void connection_manager_task(void *pvParameters)
             egos_ethernet_start();
             s_conn_state = EGOS_CONN_TRYING_ETHERNET;
 #else
-            /* Decide which WiFi credentials to try first */
-            if (egos_nvs_has_wifi_creds()) {
-                s_cred_source = EGOS_CRED_STORED;
-                egos_led_update(EGOS_LED_WIFI_CONNECTING_STORED);
-            } else {
-                s_cred_source = EGOS_CRED_DEFAULT;
-                egos_led_update(EGOS_LED_WIFI_CONNECTING_DEFAULT);
-            }
-            ESP_LOGI(TAG, "Connecting WiFi (%s credentials)...",
-                     s_cred_source == EGOS_CRED_STORED ? "stored" : "default");
-            egos_wifi_connect(s_cred_source);
+            /* Uses the sticky preferred source, which starts at STORED. A
+             * failure here is handled by EGOS_CONN_TRYING_WIFI, which retries
+             * and alternates rather than leaving the module stuck. */
+            wifi_connect_preferred();
             s_conn_state = EGOS_CONN_TRYING_WIFI;
 #endif
             break;
@@ -178,17 +277,11 @@ static void connection_manager_task(void *pvParameters)
                 ESP_LOGW(TAG, "Ethernet timeout, falling back to WiFi");
                 egos_ethernet_stop();
 
-                if (egos_nvs_has_wifi_creds()) {
-                    s_cred_source = EGOS_CRED_STORED;
-                    s_active_network = EGOS_NET_WIFI_STORED;
-                    egos_led_update(EGOS_LED_WIFI_CONNECTING_STORED);
-                } else {
-                    s_cred_source = EGOS_CRED_DEFAULT;
-                    s_active_network = EGOS_NET_WIFI_DEFAULT;
-                    egos_led_update(EGOS_LED_WIFI_CONNECTING_DEFAULT);
-                }
+                wifi_connect_preferred();
+                s_active_network = (s_cred_source == EGOS_CRED_STORED)
+                                   ? EGOS_NET_WIFI_STORED
+                                   : EGOS_NET_WIFI_DEFAULT;
 
-                egos_wifi_connect(s_cred_source);
                 s_conn_state = EGOS_CONN_TRYING_WIFI;
                 state_timer = 0;
             }
@@ -196,11 +289,35 @@ static void connection_manager_task(void *pvParameters)
 #endif
 
         case EGOS_CONN_TRYING_WIFI:
-            if (s_wifi_connected) {
+            /* egos_wifi_is_connected() is checked as well as the callback flag:
+             * the WiFi module sets its own state before signalling the event
+             * group, so a successful connect can return here before
+             * wifi_status_cb() has run. Without this we could briefly see
+             * "not connected" and start a needless retry. */
+            if (s_wifi_connected || egos_wifi_is_connected()) {
                 char ip[16];
                 egos_wifi_get_ip(ip, sizeof(ip));
                 ESP_LOGI(TAG, "WiFi connected (IP: %s)", ip);
+                state_timer = 0;
                 s_conn_state = EGOS_CONN_NETWORK_READY;
+                break;
+            }
+
+            /* Not connected. Retry after the backoff, alternating credential
+             * source as wifi_connect_preferred() sees fit. Without this the
+             * state machine would wait here forever for a connection that is
+             * never coming. egos_wifi_connect() blocks until it succeeds or
+             * times out, so this does not spin. */
+            state_timer += TICK_MS;
+            if (state_timer >= s_wifi_retry_backoff_ms) {
+                state_timer = 0;
+                if (wifi_connect_preferred() == ESP_OK) {
+#ifdef CONFIG_EGOS_ETHERNET_ENABLED
+                    s_active_network = (s_cred_source == EGOS_CRED_STORED)
+                                       ? EGOS_NET_WIFI_STORED
+                                       : EGOS_NET_WIFI_DEFAULT;
+#endif
+                }
             }
             break;
 
@@ -255,20 +372,22 @@ static void connection_manager_task(void *pvParameters)
             switch (s_active_network) {
                 case EGOS_NET_ETHERNET:
                     egos_ethernet_stop();
-                    s_cred_source = EGOS_CRED_DEFAULT;
+                    /* Drive the preference so the TRYING_WIFI retry path
+                     * resumes on the network we are switching to */
+                    s_preferred_cred_source = EGOS_CRED_DEFAULT;
+                    s_cred_source_failures = 0;
                     s_active_network = EGOS_NET_WIFI_DEFAULT;
-                    egos_led_update(EGOS_LED_WIFI_CONNECTING_DEFAULT);
-                    egos_wifi_connect(s_cred_source);
+                    wifi_connect_preferred();
                     s_conn_state = EGOS_CONN_TRYING_WIFI;
                     break;
 
                 case EGOS_NET_WIFI_DEFAULT:
                     egos_wifi_disconnect();
                     if (egos_nvs_has_wifi_creds()) {
-                        s_cred_source = EGOS_CRED_STORED;
+                        s_preferred_cred_source = EGOS_CRED_STORED;
+                        s_cred_source_failures = 0;
                         s_active_network = EGOS_NET_WIFI_STORED;
-                        egos_led_update(EGOS_LED_WIFI_CONNECTING_STORED);
-                        egos_wifi_connect(s_cred_source);
+                        wifi_connect_preferred();
                         s_conn_state = EGOS_CONN_TRYING_WIFI;
                     } else {
                         s_active_network = EGOS_NET_ETHERNET;
@@ -293,16 +412,15 @@ static void connection_manager_task(void *pvParameters)
             egos_wifi_disconnect();
 
             if (s_cred_source == EGOS_CRED_DEFAULT && egos_nvs_has_wifi_creds()) {
-                s_cred_source = EGOS_CRED_STORED;
-                egos_led_update(EGOS_LED_WIFI_CONNECTING_STORED);
+                s_preferred_cred_source = EGOS_CRED_STORED;
             } else {
-                s_cred_source = EGOS_CRED_DEFAULT;
-                egos_led_update(EGOS_LED_WIFI_CONNECTING_DEFAULT);
+                s_preferred_cred_source = EGOS_CRED_DEFAULT;
             }
+            s_cred_source_failures = 0;
 
             ESP_LOGI(TAG, "Switching to %s WiFi credentials",
-                     s_cred_source == EGOS_CRED_STORED ? "stored" : "default");
-            egos_wifi_connect(s_cred_source);
+                     cred_source_name(s_preferred_cred_source));
+            wifi_connect_preferred();
             s_conn_state = EGOS_CONN_TRYING_WIFI;
 #endif
             break;
