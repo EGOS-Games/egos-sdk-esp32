@@ -270,6 +270,18 @@ const char *egos_get_module_id(void);
  */
 bool egos_is_connected(void);
 
+/**
+ * Briefly flash the status LED to acknowledge a local input event.
+ *
+ * Modules with physical inputs use this so a button press is visibly
+ * acknowledged even when the module is offline and the event cannot be
+ * published. The LED returns to showing connection state afterwards.
+ *
+ * No-op when CONFIG_EGOS_STATUS_LED_ENABLED is off, so callers do not need
+ * to guard it.
+ */
+void egos_indicate_input(void);
+
 #ifdef __cplusplus
 }
 #endif

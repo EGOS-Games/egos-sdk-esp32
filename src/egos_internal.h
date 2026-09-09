@@ -219,6 +219,7 @@ void egos_ethernet_cleanup(void);
 #ifdef CONFIG_EGOS_STATUS_LED_ENABLED
 esp_err_t egos_led_init(void);
 void egos_led_set_state(egos_led_state_t state);
+void egos_led_flash_input(void);
 void egos_led_cleanup(void);
 #endif
 

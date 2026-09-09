@@ -126,3 +126,10 @@ bool egos_is_connected(void)
     }
     return egos_mqtt_is_connected();
 }
+
+void egos_indicate_input(void)
+{
+#ifdef CONFIG_EGOS_STATUS_LED_ENABLED
+    egos_led_flash_input();
+#endif
+}

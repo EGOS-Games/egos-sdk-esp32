@@ -54,6 +54,10 @@ static const char *TAG = "egos_led";
 static volatile egos_led_state_t s_state = EGOS_LED_OFF;
 static TaskHandle_t s_task = NULL;
 static bool s_initialized = false;
+/* One-shot input acknowledgement. Set by egos_led_flash_input() and consumed by
+ * the LED task, so the caller (typically a GPIO/button callback) is never
+ * blocked waiting for the flash to finish. */
+static volatile bool s_flash_request = false;
 
 static void set_rgb(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -124,6 +128,17 @@ static void led_task(void *pvParameters)
     uint32_t pulse_counter = 0;
 
     while (1) {
+        /* A pending input acknowledgement pre-empts the steady state for one
+         * flash, then the normal pattern resumes untouched. */
+        if (s_flash_request) {
+            s_flash_request = false;
+            set_rgb(C_BLUE);
+            vTaskDelay(pdMS_TO_TICKS(INPUT_FLASH_MS));
+            set_rgb(C_OFF);
+            vTaskDelay(pdMS_TO_TICKS(INPUT_FLASH_MS));
+            continue;
+        }
+
         switch (s_state) {
             case EGOS_LED_OFF:
                 set_rgb(0, 0, 0);
@@ -284,6 +299,12 @@ void egos_led_set_state(egos_led_state_t state)
 {
     if (!s_initialized) return;
     s_state = state;
+}
+
+void egos_led_flash_input(void)
+{
+    if (!s_initialized) return;
+    s_flash_request = true;
 }
 
 void egos_led_cleanup(void)
