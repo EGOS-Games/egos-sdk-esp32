@@ -46,8 +46,18 @@ static const char *TAG = "egos_disc";
 #define PROBE_TIMEOUT_MS    3000
 
 /* Probing addresses we are merely guessing at during a scan. Short, because
- * most will not answer and there may be 254 of them. */
-#define SCAN_TIMEOUT_MS     500
+ * most will not answer and there may be 254 of them.
+ *
+ * On a LAN this timeout is only actually paid for addresses with no host at
+ * all: a live host answers a SYN in a few milliseconds whether it is listening
+ * (SYN-ACK) or not (RST). So the sweep cost is roughly
+ * (empty addresses) x SCAN_TIMEOUT_MS, and on a sparsely populated /24 that is
+ * nearly all of them.
+ *
+ * Measured on hardware at 500ms: finding a controller at .222 took 105s. 200ms
+ * is still an order of magnitude more than a LAN round trip needs, and brings
+ * the same sweep to roughly 40s. */
+#define SCAN_TIMEOUT_MS     200
 
 #define MDNS_TIMEOUT_MS     5000
 
