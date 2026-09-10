@@ -1,4 +1,4 @@
-version: "0.5.1"
+version: "0.6.0"
 description: >-
   Reusable ESP-IDF component for building EGOS hardware modules on ESP32.
   Handles WiFi, Ethernet, MQTT, device registration and connection management,

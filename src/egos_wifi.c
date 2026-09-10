@@ -9,6 +9,7 @@
 #include "esp_event.h"
 #include "mdns.h"
 #include <string.h>
+#include <stdlib.h>
 
 static const char *TAG = "egos_wifi";
 
@@ -27,11 +28,19 @@ static bool s_initialized = false;
 static uint8_t s_last_disconnect_reason = 0;
 /* Consecutive reason-201 disconnects within the current connect attempt */
 static uint8_t s_no_ap_found_count = 0;
+/* Set while the diagnostic scan runs. esp_wifi_start() fires STA_START,
+ * whose handler calls esp_wifi_connect(); a scan cannot start while a
+ * connect is in flight, so without this the diagnostic silently fails and
+ * reports an empty AP list - which reads exactly like a dead radio. */
+static volatile bool s_diag_scan_active = false;
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                 int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        if (s_diag_scan_active) {
+            return;             /* scanning, do not auto-connect */
+        }
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
@@ -121,6 +130,63 @@ esp_err_t egos_wifi_init(egos_internal_status_cb_t status_cb)
     s_initialized = true;
     ESP_LOGI(TAG, "WiFi initialized");
     return ESP_OK;
+}
+
+
+/**
+ * Log every AP the radio can actually hear.
+ *
+ * "SSID not found" on its own is a dead end: it cannot distinguish an AP that
+ * is switched off from one that is simply out of reach of THIS board, and the
+ * two need completely different fixes. Reading the radio at the moment it gives
+ * up settles that, and the RSSI says whether a marginal signal is the problem.
+ *
+ * Must run in task context, not the event handler - esp_wifi_scan_start() with
+ * block=true cannot be called from the event loop.
+ */
+static void log_visible_aps(const char *wanted_ssid)
+{
+    wifi_scan_config_t scan_cfg = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,               /* all channels */
+        .show_hidden = true,
+    };
+
+    esp_err_t serr = esp_wifi_scan_start(&scan_cfg, true);
+    if (serr != ESP_OK) {
+        ESP_LOGW(TAG, "diagnostic scan did not run (%s) - no conclusion can be"
+                      " drawn about what the radio can hear", esp_err_to_name(serr));
+        return;
+    }
+
+    uint16_t count = 0;
+    esp_wifi_scan_get_ap_num(&count);
+    if (count == 0) {
+        ESP_LOGE(TAG, "Scan ran but found NOTHING - if other devices nearby can "
+                      "see networks, suspect this board's antenna");
+        return;
+    }
+
+    uint16_t max = count > 20 ? 20 : count;
+    wifi_ap_record_t *recs = calloc(max, sizeof(wifi_ap_record_t));
+    if (recs == NULL) {
+        esp_wifi_clear_ap_list();
+        return;
+    }
+
+    esp_wifi_scan_get_ap_records(&max, recs);
+
+    ESP_LOGW(TAG, "--- radio can hear %u network(s); '%s' is not among them ---",
+             (unsigned)count, wanted_ssid ? wanted_ssid : "?");
+    for (uint16_t i = 0; i < max; i++) {
+        ESP_LOGW(TAG, "    %-32s ch %2d  %4d dBm  auth %d",
+                 (const char *)recs[i].ssid, recs[i].primary,
+                 recs[i].rssi, recs[i].authmode);
+    }
+
+    free(recs);
+    esp_wifi_clear_ap_list();
 }
 
 esp_err_t egos_wifi_connect(egos_cred_source_t source, egos_cred_source_t *actual_source)
@@ -214,6 +280,21 @@ esp_err_t egos_wifi_connect(egos_cred_source_t source, egos_cred_source_t *actua
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
 
     if (bits & WIFI_FAIL_BIT) {
+        /* Only for the "not in range" case. A wrong password or a
+         * rejecting AP is a different failure and the scan would say
+         * nothing useful about it. */
+        if (s_last_disconnect_reason == EGOS_WIFI_REASON_NO_AP_FOUND) {
+            s_diag_scan_active = true;
+            esp_wifi_start();
+            /* Let the PHY settle before scanning. Scanning the instant the
+             * driver starts can return an empty list on its own, which
+             * would make this diagnostic lie in exactly the direction that
+             * matters - reporting a dead radio when the radio is fine. */
+            vTaskDelay(pdMS_TO_TICKS(500));
+            log_visible_aps((const char *)wifi_config.sta.ssid);
+            esp_wifi_stop();
+            s_diag_scan_active = false;
+        }
         return ESP_FAIL;
     }
 
