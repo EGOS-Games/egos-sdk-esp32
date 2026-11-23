@@ -91,3 +91,31 @@ bool egos_module_auth_log_due(int64_t now_us, int64_t *last_us,
     }
     return false;
 }
+
+uint32_t egos_module_auth_next_backoff_ms(uint32_t previous_ms)
+{
+    if (previous_ms < EGOS_MODULE_AUTH_BACKOFF_MIN_MS) {
+        return EGOS_MODULE_AUTH_BACKOFF_MIN_MS;
+    }
+    if (previous_ms >= EGOS_MODULE_AUTH_BACKOFF_MAX_MS / 2) {
+        return EGOS_MODULE_AUTH_BACKOFF_MAX_MS;
+    }
+    return previous_ms * 2;
+}
+
+bool egos_module_auth_is_secret_topic(const char *topic, size_t topic_len,
+                                      const char *module_id)
+{
+    static const char suffix[] = "/module/secret";
+    const size_t suffix_len = sizeof(suffix) - 1;
+
+    if (topic == NULL || module_id == NULL) {
+        return false;
+    }
+    size_t id_len = strlen(module_id);
+    if (id_len == 0 || topic_len != id_len + suffix_len) {
+        return false;
+    }
+    return memcmp(topic, module_id, id_len) == 0 &&
+           memcmp(topic + id_len, suffix, suffix_len) == 0;
+}

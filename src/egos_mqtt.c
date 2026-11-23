@@ -8,6 +8,7 @@
 #include "mdns.h"
 #include "cJSON.h"
 #include "esp_timer.h"
+#include "freertos/semphr.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* malloc/free for incoming payloads */
@@ -21,16 +22,38 @@ static volatile bool s_connected = false;
 static esp_timer_handle_t s_timeout_timer = NULL;
 
 /* Module secret (protocol v1, egos_module_auth.h). s_secret is what THIS
- * client sends as its password, loaded from NVS in egos_mqtt_init(); a secret
- * that arrives mid-connection goes to NVS only and is picked up by the next
- * egos_mqtt_init(). NEVER log s_secret. */
+ * client sends as its password, loaded in egos_mqtt_init(). A secret that
+ * arrives mid-connection is saved to NVS and picked up by the next
+ * egos_mqtt_init(). If that save fails it waits in s_pending_secret (RAM):
+ * egos_mqtt_init() uses it when NVS has none, and every connect retries the
+ * save. NEVER log either. */
 static char    s_secret[EGOS_MODULE_SECRET_BUF_SIZE];
 static bool    s_using_secret = false;
+static char    s_pending_secret[EGOS_MODULE_SECRET_BUF_SIZE];
 static char    s_broker_uri[128];
 static int64_t s_last_forget_log_us = 0;
 
 /** How often the "press Forget" message repeats while the broker refuses us. */
 #define FORGET_LOG_INTERVAL_US  (60LL * 1000 * 1000)
+
+/* Backoff after CONNACK 5 (our id has a secret we do not hold). esp-mqtt's own
+ * reconnect is a fixed 1 s, so on that refusal the client is stopped and then
+ * restarted from s_backoff_timer after 1 s, 2 s, 4 s ... 60 s. The delay resets
+ * on MQTT_EVENT_CONNECTED. The timer callback runs in the esp_timer task, never
+ * in the MQTT task (which cannot stop its own client). s_client_lock keeps it
+ * from racing egos_mqtt_stop(), which destroys the client. */
+typedef enum {
+    BACKOFF_IDLE,       /**< Not backing off */
+    BACKOFF_STOPPING,   /**< Timer armed to stop the refused client */
+    BACKOFF_WAITING,    /**< Client stopped; timer armed to restart it */
+} backoff_phase_t;
+
+static esp_timer_handle_t s_backoff_timer = NULL;
+static SemaphoreHandle_t  s_client_lock = NULL;
+static volatile backoff_phase_t s_backoff_phase = BACKOFF_IDLE;
+static uint32_t s_backoff_ms = 0;
+/** Set by a CONNACK 5 refusal, cleared on connect: keeps the auth-error LED. */
+static volatile bool s_auth_refused = false;
 
 /* Module-defined topics under "{moduleId}/". Small and fixed: a module
  * that needs more than a handful of side channels is describing devices,
@@ -263,15 +286,26 @@ static void handle_module_secret(const char *data, int data_len)
         return;
     }
 
-    if (s_using_secret && strcmp(s_secret, secret_str) == 0) {
-        ESP_LOGI(TAG, "Module secret unchanged");
-    } else if (egos_nvs_save_module_secret(secret_str) == ESP_OK) {
+    /* The controller issues a secret only to a connection that has none, so
+     * one arriving while we hold one is not from the protocol: ignore it,
+     * rather than let it replace a secret that works. */
+    if (s_using_secret || s_pending_secret[0] != '\0') {
+        ESP_LOGW(TAG, "Module secret message while a secret is already held - ignoring");
+        cJSON_Delete(json);
+        return;
+    }
+
+    if (egos_nvs_save_module_secret(secret_str) == ESP_OK) {
         /* This connection carries on as it is; the next one sends it. */
         ESP_LOGI(TAG, "Module secret received; it is used from the next connection");
+    } else {
+        /* The controller now holds this secret, so losing it would leave the
+         * module refused until someone presses Forget. Keep it in RAM:
+         * egos_mqtt_init() uses it and every connect retries the save. */
+        strncpy(s_pending_secret, secret_str, sizeof(s_pending_secret) - 1);
+        s_pending_secret[sizeof(s_pending_secret) - 1] = '\0';
+        ESP_LOGW(TAG, "Module secret kept in RAM until it can be saved");
     }
-    /* On a save failure egos_nvs has logged it. The controller still holds
-     * the secret, so the next connection without it is refused (CONNACK 5)
-     * until someone presses Forget. Nothing better to do here. */
 
     cJSON_Delete(json);
 }
@@ -338,7 +372,9 @@ static void handle_mqtt_data(esp_mqtt_event_handle_t event)
         handle_credentials_set(event->data, event->data_len);
     } else if (topic_ends_with(topic_buf, topic_len, "/credentials/reset")) {
         handle_credentials_reset();
-    } else if (topic_ends_with(topic_buf, topic_len, "/module/secret")) {
+    } else if (egos_module_auth_is_secret_topic(event->topic, (size_t)event->topic_len,
+                                                egos_g_module_id)) {
+        /* Exactly "{our id}/module/secret", matched on the untruncated topic. */
         handle_module_secret(event->data, event->data_len);
     } else if (topic_ends_with(topic_buf, topic_len, "/configuration/set")) {
         handle_configuration_set(topic_buf, topic_len, event->data, event->data_len);
@@ -386,6 +422,44 @@ static void timeout_timer_cb(void *arg)
  * Refused Connections (module secrets, protocol v1)
  * -------------------------------------------------------------------------- */
 
+/** How soon after a CONNACK 5 the client is stopped: well inside esp-mqtt's
+ *  1 s reconnect_timeout_ms, so its own retry never runs. */
+#define BACKOFF_STOP_DELAY_US   (10 * 1000)
+
+/**
+ * s_backoff_timer callback (esp_timer task). Two steps on one timer:
+ * STOPPING stops the refused client and re-arms for s_backoff_ms; WAITING
+ * starts it again. egos_mqtt_stop() resets the phase to IDLE under the same
+ * lock, so a timer that fires after the client is gone does nothing.
+ */
+static void backoff_timer_cb(void *arg)
+{
+    if (!s_client_lock || xSemaphoreTake(s_client_lock, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+
+    if (s_client == NULL) {
+        s_backoff_phase = BACKOFF_IDLE;
+    } else if (s_backoff_phase == BACKOFF_STOPPING) {
+        esp_mqtt_client_stop(s_client);
+        s_backoff_phase = BACKOFF_WAITING;
+        ESP_LOGI(TAG, "Retrying the MQTT connection in %lu ms",
+                 (unsigned long)s_backoff_ms);
+        if (esp_timer_start_once(s_backoff_timer, (uint64_t)s_backoff_ms * 1000) != ESP_OK) {
+            /* Never leave the client stopped for good. */
+            s_backoff_phase = BACKOFF_IDLE;
+            esp_mqtt_client_start(s_client);
+        }
+    } else if (s_backoff_phase == BACKOFF_WAITING) {
+        s_backoff_phase = BACKOFF_IDLE;
+        if (esp_mqtt_client_start(s_client) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to restart the MQTT client after backoff");
+        }
+    }
+
+    xSemaphoreGive(s_client_lock);
+}
+
 /**
  * Called from the MQTT task when the broker refuses a CONNECT. esp-mqtt then
  * waits reconnect_timeout_ms and reconnects with the client's current
@@ -402,6 +476,7 @@ static void handle_connection_refused(int connack_code)
                      "clearing it and reconnecting without one", connack_code);
             egos_nvs_clear_module_secret();
             memset(s_secret, 0, sizeof(s_secret));
+            memset(s_pending_secret, 0, sizeof(s_pending_secret));
             s_using_secret = false;
 
             /* esp_mqtt_client_set_uri() is the light way to change the
@@ -424,9 +499,10 @@ static void handle_connection_refused(int connack_code)
 
         case EGOS_AUTH_REFUSAL_NEEDS_FORGET:
             /* Our id already has a secret on this controller that this module
-             * does not hold (reflashed, NVS erased, or a secret that never
-             * reached flash). Keep the normal reconnect; just say what to do,
-             * once a minute rather than on every 1s retry. */
+             * does not hold (reflashed, NVS erased). Retry with backoff, and
+             * say what to do at most once a minute. */
+            s_auth_refused = true;
+            s_backoff_ms = egos_module_auth_next_backoff_ms(s_backoff_ms);
             if (egos_module_auth_log_due(esp_timer_get_time(), &s_last_forget_log_us,
                                          FORGET_LOG_INTERVAL_US)) {
                 ESP_LOGE(TAG, "Controller refused module %s (CONNACK %d): it already has a "
@@ -435,6 +511,16 @@ static void handle_connection_refused(int connack_code)
                          egos_g_module_id, connack_code);
             }
             egos_led_update(EGOS_LED_AUTH_ERROR);
+
+            /* esp-mqtt would retry in reconnect_timeout_ms (1 s). Stop the
+             * client from the esp_timer task well before that; the same timer
+             * then restarts it after s_backoff_ms. */
+            if (s_backoff_timer && s_backoff_phase == BACKOFF_IDLE) {
+                s_backoff_phase = BACKOFF_STOPPING;
+                if (esp_timer_start_once(s_backoff_timer, BACKOFF_STOP_DELAY_US) != ESP_OK) {
+                    s_backoff_phase = BACKOFF_IDLE;   /* falls back to the 1 s retry */
+                }
+            }
             break;
 
         case EGOS_AUTH_REFUSAL_OTHER:
@@ -461,6 +547,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             }
             s_connected = true;
             s_last_forget_log_us = 0;
+            s_auth_refused = false;
+            s_backoff_ms = 0;
+            /* A secret that could not be saved when it arrived: try again. */
+            if (s_pending_secret[0] != '\0' &&
+                egos_nvs_save_module_secret(s_pending_secret) == ESP_OK) {
+                memset(s_pending_secret, 0, sizeof(s_pending_secret));
+            }
             /* Subscribe first: the controller answers module/register on
              * {id}/module/secret (and re-sends {id}/credentials/set), and
              * esp-mqtt sends these packets in the order they are queued. */
@@ -511,6 +604,32 @@ esp_err_t egos_mqtt_init(const char *broker_uri,
         egos_mqtt_stop();
     }
 
+    if (broker_uri == NULL || strlen(broker_uri) >= sizeof(s_broker_uri)) {
+        /* s_broker_uri is what a CONNACK 4 rebuilds the credentials from;
+         * a truncated copy would point the retry at the wrong broker. */
+        ESP_LOGE(TAG, "Broker URI is missing or longer than %u characters",
+                 (unsigned)(sizeof(s_broker_uri) - 1));
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_client_lock) {
+        s_client_lock = xSemaphoreCreateMutex();
+        if (!s_client_lock) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (!s_backoff_timer) {
+        /* Created once and never deleted, so a callback in flight can
+         * never find it gone. */
+        esp_timer_create_args_t backoff_args = {
+            .callback = backoff_timer_cb,
+            .name = "mqtt_backoff",
+        };
+        if (esp_timer_create(&backoff_args, &s_backoff_timer) != ESP_OK) {
+            s_backoff_timer = NULL;   /* CONNACK 5 then keeps the 1 s retry */
+        }
+    }
+
     s_status_cb = status_cb;
     s_timeout_cb = timeout_cb;
 
@@ -523,11 +642,15 @@ esp_err_t egos_mqtt_init(const char *broker_uri,
      * the stored secret, or empty (NULL, so esp-mqtt sends no password field)
      * to ask the controller for one. The client id stays the module id. */
     s_using_secret = (egos_nvs_load_module_secret(s_secret, sizeof(s_secret)) == ESP_OK);
+    if (!s_using_secret && egos_module_secret_is_valid(s_pending_secret)) {
+        /* Received but never saved (NVS write failed): still ours. */
+        memcpy(s_secret, s_pending_secret, sizeof(s_secret));
+        s_using_secret = true;
+    }
     if (!s_using_secret) {
         memset(s_secret, 0, sizeof(s_secret));
     }
-    strncpy(s_broker_uri, broker_uri, sizeof(s_broker_uri) - 1);
-    s_broker_uri[sizeof(s_broker_uri) - 1] = '\0';
+    memcpy(s_broker_uri, broker_uri, strlen(broker_uri) + 1);
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = broker_uri,
@@ -602,10 +725,23 @@ esp_err_t egos_mqtt_stop(void)
         s_timeout_timer = NULL;
     }
 
+    /* Under s_client_lock so a backoff callback is either finished or will
+     * see s_client == NULL; never inside it. The backoff delay (s_backoff_ms)
+     * is kept: only a successful connect resets it. */
+    bool locked = s_client_lock && xSemaphoreTake(s_client_lock, portMAX_DELAY) == pdTRUE;
+    if (s_backoff_timer) {
+        esp_timer_stop(s_backoff_timer);
+    }
+    s_backoff_phase = BACKOFF_IDLE;
+
     if (s_client) {
+        /* Fails harmlessly (ESP_FAIL) when backoff already stopped it. */
         esp_mqtt_client_stop(s_client);
         esp_mqtt_client_destroy(s_client);
         s_client = NULL;
+    }
+    if (locked) {
+        xSemaphoreGive(s_client_lock);
     }
 
     s_connected = false;
@@ -616,6 +752,16 @@ esp_err_t egos_mqtt_stop(void)
 bool egos_mqtt_is_connected(void)
 {
     return s_connected;
+}
+
+bool egos_mqtt_auth_refused(void)
+{
+    return s_auth_refused;
+}
+
+bool egos_mqtt_is_backing_off(void)
+{
+    return s_backoff_phase != BACKOFF_IDLE;
 }
 
 esp_err_t egos_mqtt_publish_input(const char *device_id, const char *command,

@@ -233,6 +233,11 @@ esp_err_t egos_mqtt_init(const char *broker_uri,
 esp_err_t egos_mqtt_connect(void);
 esp_err_t egos_mqtt_stop(void);
 bool egos_mqtt_is_connected(void);
+/** True from a CONNACK 5 refusal (id bound to a secret we lack) until the
+ *  next successful connect. The auth-error LED must not be overwritten. */
+bool egos_mqtt_auth_refused(void);
+/** True while the client is stopped or about to be, waiting out its backoff. */
+bool egos_mqtt_is_backing_off(void);
 esp_err_t egos_mqtt_publish_input(const char *device_id, const char *command,
                                    const char *params_json);
 esp_err_t egos_mqtt_publish_state(const char *device_id, const char *state_json);

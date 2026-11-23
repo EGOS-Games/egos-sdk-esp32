@@ -343,10 +343,16 @@ does not change. Protocol: "Module secrets (protocol v1)" in egos-controller
   in the controller): the SDK deletes the secret and reconnects without one,
   and the controller issues a new one.
 - **Refused with CONNACK 5** without a secret (the controller already has a
-  secret for this module id, e.g. after a reflash): the SDK keeps retrying,
-  shows the auth-error LED and logs, once a minute, that someone must press
+  secret for this module id, e.g. after a reflash): the SDK keeps retrying
+  with backoff (1 s, doubling to 60 s, reset by a successful connect), keeps
+  the auth-error LED on and logs, once a minute, that someone must press
   **Forget** for this module in the controller's Settings > Paired devices.
+- **Spoofing:** only the exact topic `{moduleId}/module/secret` is read, and a
+  secret message is ignored while the module already holds a secret.
+- **Failed save:** if NVS cannot store a new secret, the SDK keeps it in RAM,
+  uses it on the next connection and retries the save on every connect.
 - The secret is never logged.
+- **Tests:** the ESP-IDF-free logic has host tests: `make -C test/host test`.
 - **Losing it:** a full flash erase, or `nvs_flash_init()` reporting
   `NO_FREE_PAGES`/`NEW_VERSION_FOUND` (the SDK then erases the NVS partition),
   loses the secret. The module then needs **Forget** in the controller.

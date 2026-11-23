@@ -89,6 +89,25 @@ egos_auth_refusal_action_t egos_module_auth_refusal_action(int connack_code,
  */
 bool egos_module_auth_anonymous_uri(const char *uri, char *out, size_t out_len);
 
+/** Reconnect backoff after CONNACK 5: 1 s, doubling, capped at 60 s. */
+#define EGOS_MODULE_AUTH_BACKOFF_MIN_MS     1000u
+#define EGOS_MODULE_AUTH_BACKOFF_MAX_MS     60000u
+
+/**
+ * The next reconnect delay after a CONNACK 5 refusal.
+ *
+ * @param previous_ms  The delay used last time, or 0 for the first refusal
+ * @return 1000 for the first, then double the previous, never above 60000
+ */
+uint32_t egos_module_auth_next_backoff_ms(uint32_t previous_ms);
+
+/**
+ * True when `topic` (topic_len bytes, need not be NUL terminated) is exactly
+ * "{module_id}/module/secret". Only that topic may carry our secret.
+ */
+bool egos_module_auth_is_secret_topic(const char *topic, size_t topic_len,
+                                      const char *module_id);
+
 /**
  * Throttle for a repeated log line: true when it should be printed now.
  * Updates *last_us when it returns true. A *last_us of 0 means "never logged".

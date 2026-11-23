@@ -2,9 +2,13 @@
  * @file test_module_auth.c
  * @brief Host unit tests for src/egos_module_auth.c (no ESP-IDF needed)
  *
- * Build and run from the repository root with any C99 compiler:
+ * Build and run with any C99 compiler, from the repository root:
  *
- *   gcc -std=c99 -Wall -Wextra -Isrc -o test_module_auth \
+ *   make -C test/host test          (CC=clang make -C test/host test)
+ *
+ * or without make:
+ *
+ *   gcc -std=c99 -Wall -Wextra -Werror -Isrc -o test_module_auth \
  *       test/host/test_module_auth.c src/egos_module_auth.c && ./test_module_auth
  */
 
@@ -109,8 +113,53 @@ static void test_log_due(void)
     CHECK(last == 5000000 + minute);
 }
 
+static void test_next_backoff(void)
+{
+    CHECK(egos_module_auth_next_backoff_ms(0) == 1000);
+    CHECK(egos_module_auth_next_backoff_ms(1) == 1000);
+    CHECK(egos_module_auth_next_backoff_ms(1000) == 2000);
+    CHECK(egos_module_auth_next_backoff_ms(2000) == 4000);
+    CHECK(egos_module_auth_next_backoff_ms(16000) == 32000);
+    CHECK(egos_module_auth_next_backoff_ms(32000) == 60000);
+    CHECK(egos_module_auth_next_backoff_ms(60000) == 60000);
+    CHECK(egos_module_auth_next_backoff_ms(0xFFFFFFFFu) == 60000);
+
+    /* 1, 2, 4, 8, 16, 32, 60, 60 */
+    uint32_t delay = 0;
+    for (int i = 0; i < 8; i++) {
+        delay = egos_module_auth_next_backoff_ms(delay);
+    }
+    CHECK(delay == 60000);
+}
+
+static void test_is_secret_topic(void)
+{
+    const char *id = "dmx-AABBCCDDEEFF";
+    const char *t = "dmx-AABBCCDDEEFF/module/secret";
+
+    CHECK(egos_module_auth_is_secret_topic(t, strlen(t), id));
+    /* Not NUL terminated: only topic_len counts */
+    CHECK(egos_module_auth_is_secret_topic("dmx-AABBCCDDEEFF/module/secretXYZ", strlen(t), id));
+
+    /* Another module's secret, or a suffix match on a longer topic */
+    const char *other = "dmx-112233445566/module/secret";
+    CHECK(!egos_module_auth_is_secret_topic(other, strlen(other), id));
+    const char *longer = "x/dmx-AABBCCDDEEFF/module/secret";
+    CHECK(!egos_module_auth_is_secret_topic(longer, strlen(longer), id));
+    const char *prefixed = "evil-dmx-AABBCCDDEEFF/module/secret";
+    CHECK(!egos_module_auth_is_secret_topic(prefixed, strlen(prefixed), id));
+    const char *custom = "dmx-AABBCCDDEEFF/custom/module/secret";
+    CHECK(!egos_module_auth_is_secret_topic(custom, strlen(custom), id));
+    const char *bare = "/module/secret";
+    CHECK(!egos_module_auth_is_secret_topic(bare, strlen(bare), ""));
+    CHECK(!egos_module_auth_is_secret_topic(NULL, 0, id));
+    CHECK(!egos_module_auth_is_secret_topic(t, strlen(t), NULL));
+}
+
 int main(void)
 {
+    test_next_backoff();
+    test_is_secret_topic();
     test_secret_is_valid();
     test_message_is_valid();
     test_refusal_action();

@@ -107,7 +107,11 @@ static void mqtt_status_cb(bool connected)
         }
     } else {
         ESP_LOGW(TAG, "MQTT disconnected");
-        egos_led_update(EGOS_LED_MQTT_CONNECTING);
+        /* After a CONNACK 5 the auth-error LED tells the operator to press
+         * Forget; the disconnect that follows the refusal must not hide it. */
+        if (!egos_mqtt_auth_refused()) {
+            egos_led_update(EGOS_LED_MQTT_CONNECTING);
+        }
 
         if (egos_g_config.on_disconnected) {
             egos_g_config.on_disconnected(egos_g_config.user_data);
@@ -366,8 +370,12 @@ static void connection_manager_task(void *pvParameters)
              * lost connection. Without it a second connect raced the first and
              * the module registered its devices twice per boot, ~300ms apart,
              * and called on_connected twice. egos_mqtt has its own connect
-             * timeout, so waiting here costs nothing. */
-            if (!s_mqtt_connected && s_mqtt_established && (s_wifi_connected
+             * timeout, so waiting here costs nothing.
+             *
+             * Never while egos_mqtt is backing off after a CONNACK 5: a fresh
+             * client would connect at once and skip the backoff. */
+            if (!s_mqtt_connected && s_mqtt_established &&
+                !egos_mqtt_auth_refused() && !egos_mqtt_is_backing_off() && (s_wifi_connected
 #ifdef CONFIG_EGOS_ETHERNET_ENABLED
                 || s_ethernet_connected
 #endif
