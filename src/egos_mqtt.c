@@ -20,6 +20,18 @@ static egos_internal_timeout_cb_t s_timeout_cb = NULL;
 static volatile bool s_connected = false;
 static esp_timer_handle_t s_timeout_timer = NULL;
 
+/* Module secret (protocol v1, egos_module_auth.h). s_secret is what THIS
+ * client sends as its password, loaded from NVS in egos_mqtt_init(); a secret
+ * that arrives mid-connection goes to NVS only and is picked up by the next
+ * egos_mqtt_init(). NEVER log s_secret. */
+static char    s_secret[EGOS_MODULE_SECRET_BUF_SIZE];
+static bool    s_using_secret = false;
+static char    s_broker_uri[128];
+static int64_t s_last_forget_log_us = 0;
+
+/** How often the "press Forget" message repeats while the broker refuses us. */
+#define FORGET_LOG_INTERVAL_US  (60LL * 1000 * 1000)
+
 /* Module-defined topics under "{moduleId}/". Small and fixed: a module
  * that needs more than a handful of side channels is describing devices,
  * and those belong in the device table where the controller can see them. */
@@ -143,6 +155,12 @@ static void subscribe_topics(void)
     snprintf(topic, sizeof(topic), "%s/credentials/reset", egos_g_module_id);
     esp_mqtt_client_subscribe(s_client, topic, 1);
 
+    /* The controller answers module/register with our secret here when we
+     * connected without one. Subscribed on every connect, before the caller
+     * publishes module/register, so the answer cannot arrive first. */
+    snprintf(topic, sizeof(topic), "%s/module/secret", egos_g_module_id);
+    esp_mqtt_client_subscribe(s_client, topic, 1);
+
     /* Re-subscribed on every reconnect, not just the first connect, so a
      * module keeps its side channels across a broker restart. */
     for (uint8_t i = 0; i < s_custom_sub_count; i++) {
@@ -224,6 +242,40 @@ static void handle_credentials_reset(void)
     esp_restart();
 }
 
+static void handle_module_secret(const char *data, int data_len)
+{
+    /* NEVER log the secret or the payload: only that one was stored or not. */
+    cJSON *json = cJSON_ParseWithLength(data, data_len);
+    if (!json) {
+        ESP_LOGW(TAG, "Module secret message is not valid JSON - ignoring");
+        return;
+    }
+
+    cJSON *secret = cJSON_GetObjectItem(json, "secret");
+    cJSON *version = cJSON_GetObjectItem(json, "version");
+    const char *secret_str = cJSON_IsString(secret) ? secret->valuestring : NULL;
+    bool version_is_number = cJSON_IsNumber(version);
+
+    if (!egos_module_secret_message_is_valid(secret_str, version_is_number,
+                                             version_is_number ? version->valuedouble : 0)) {
+        ESP_LOGW(TAG, "Module secret message is malformed or an unknown version - ignoring");
+        cJSON_Delete(json);
+        return;
+    }
+
+    if (s_using_secret && strcmp(s_secret, secret_str) == 0) {
+        ESP_LOGI(TAG, "Module secret unchanged");
+    } else if (egos_nvs_save_module_secret(secret_str) == ESP_OK) {
+        /* This connection carries on as it is; the next one sends it. */
+        ESP_LOGI(TAG, "Module secret received; it is used from the next connection");
+    }
+    /* On a save failure egos_nvs has logged it. The controller still holds
+     * the secret, so the next connection without it is refused (CONNACK 5)
+     * until someone presses Forget. Nothing better to do here. */
+
+    cJSON_Delete(json);
+}
+
 static void handle_output_command(const char *topic, int topic_len,
                                    const char *data, int data_len)
 {
@@ -286,6 +338,8 @@ static void handle_mqtt_data(esp_mqtt_event_handle_t event)
         handle_credentials_set(event->data, event->data_len);
     } else if (topic_ends_with(topic_buf, topic_len, "/credentials/reset")) {
         handle_credentials_reset();
+    } else if (topic_ends_with(topic_buf, topic_len, "/module/secret")) {
+        handle_module_secret(event->data, event->data_len);
     } else if (topic_ends_with(topic_buf, topic_len, "/configuration/set")) {
         handle_configuration_set(topic_buf, topic_len, event->data, event->data_len);
     } else if (topic_ends_with(topic_buf, topic_len, "/output")) {
@@ -329,6 +383,68 @@ static void timeout_timer_cb(void *arg)
 }
 
 /* --------------------------------------------------------------------------
+ * Refused Connections (module secrets, protocol v1)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Called from the MQTT task when the broker refuses a CONNECT. esp-mqtt then
+ * waits reconnect_timeout_ms and reconnects with the client's current
+ * credentials, so anything that must change for the next attempt changes here.
+ */
+static void handle_connection_refused(int connack_code)
+{
+    switch (egos_module_auth_refusal_action(connack_code, s_using_secret)) {
+        case EGOS_AUTH_REFUSAL_DROP_SECRET: {
+            /* The controller no longer knows our secret: someone pressed
+             * Forget. Drop it and come back without one, so the controller
+             * issues a new one after module/register. */
+            ESP_LOGW(TAG, "Controller refused the module secret (CONNACK %d); "
+                     "clearing it and reconnecting without one", connack_code);
+            egos_nvs_clear_module_secret();
+            memset(s_secret, 0, sizeof(s_secret));
+            s_using_secret = false;
+
+            /* esp_mqtt_client_set_uri() is the light way to change the
+             * username and password of a live client: it takes the client's
+             * recursive API lock (we already hold it on this task) and, unlike
+             * esp_mqtt_set_config(), does not rebuild the message buffers in
+             * the middle of the client's own event dispatch. The URI carries
+             * username "module" and an EMPTY password, never a secret, so its
+             * debug log line is harmless. */
+            char uri[sizeof(s_broker_uri) + sizeof(EGOS_MODULE_AUTH_USERNAME) + 2];
+            if (!egos_module_auth_anonymous_uri(s_broker_uri, uri, sizeof(uri)) ||
+                esp_mqtt_client_set_uri(s_client, uri) != ESP_OK) {
+                /* The client keeps sending the old secret and keeps being
+                 * refused; the next egos_mqtt_init() (network switch or
+                 * reboot) loads the now-empty store and recovers. */
+                ESP_LOGE(TAG, "Could not drop the secret from the live MQTT client");
+            }
+            break;
+        }
+
+        case EGOS_AUTH_REFUSAL_NEEDS_FORGET:
+            /* Our id already has a secret on this controller that this module
+             * does not hold (reflashed, NVS erased, or a secret that never
+             * reached flash). Keep the normal reconnect; just say what to do,
+             * once a minute rather than on every 1s retry. */
+            if (egos_module_auth_log_due(esp_timer_get_time(), &s_last_forget_log_us,
+                                         FORGET_LOG_INTERVAL_US)) {
+                ESP_LOGE(TAG, "Controller refused module %s (CONNACK %d): it already has a "
+                         "secret for this module. Press \"Forget\" for this module in the "
+                         "controller's Settings > Paired devices.",
+                         egos_g_module_id, connack_code);
+            }
+            egos_led_update(EGOS_LED_AUTH_ERROR);
+            break;
+
+        case EGOS_AUTH_REFUSAL_OTHER:
+        default:
+            ESP_LOGW(TAG, "Broker refused the connection (CONNACK %d)", connack_code);
+            break;
+    }
+}
+
+/* --------------------------------------------------------------------------
  * MQTT Event Handler
  * -------------------------------------------------------------------------- */
 
@@ -344,8 +460,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 esp_timer_stop(s_timeout_timer);
             }
             s_connected = true;
-            register_devices();
+            s_last_forget_log_us = 0;
+            /* Subscribe first: the controller answers module/register on
+             * {id}/module/secret (and re-sends {id}/credentials/set), and
+             * esp-mqtt sends these packets in the order they are queued. */
             subscribe_topics();
+            register_devices();
             if (s_status_cb) {
                 s_status_cb(true);
             }
@@ -368,6 +488,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
                 ESP_LOGE(TAG, "Transport error: %s",
                          esp_err_to_name(event->error_handle->esp_transport_sock_errno));
+            } else if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
+                handle_connection_refused((int)event->error_handle->connect_return_code);
             }
             break;
 
@@ -397,9 +519,21 @@ esp_err_t egos_mqtt_init(const char *broker_uri,
     snprintf(lwt_payload, sizeof(lwt_payload),
              "{\"id\":\"%s\",\"status\":\"disconnected\"}", egos_g_module_id);
 
+    /* Module secret (protocol v1): always username "module"; the password is
+     * the stored secret, or empty (NULL, so esp-mqtt sends no password field)
+     * to ask the controller for one. The client id stays the module id. */
+    s_using_secret = (egos_nvs_load_module_secret(s_secret, sizeof(s_secret)) == ESP_OK);
+    if (!s_using_secret) {
+        memset(s_secret, 0, sizeof(s_secret));
+    }
+    strncpy(s_broker_uri, broker_uri, sizeof(s_broker_uri) - 1);
+    s_broker_uri[sizeof(s_broker_uri) - 1] = '\0';
+
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = broker_uri,
         .credentials.client_id = egos_g_module_id,
+        .credentials.username = EGOS_MODULE_AUTH_USERNAME,
+        .credentials.authentication.password = s_using_secret ? s_secret : NULL,
         .session.keepalive = egos_g_config.mqtt.keepalive_sec,
         .session.last_will = {
             .topic = "client/disconnect",
@@ -431,8 +565,9 @@ esp_err_t egos_mqtt_init(const char *broker_uri,
         esp_timer_create(&timer_args, &s_timeout_timer);
     }
 
-    ESP_LOGI(TAG, "MQTT client initialized (broker: %s, client_id: %s)",
-             broker_uri, egos_g_module_id);
+    ESP_LOGI(TAG, "MQTT client initialized (broker: %s, client_id: %s, %s)",
+             broker_uri, egos_g_module_id,
+             s_using_secret ? "with module secret" : "no module secret yet");
     return ESP_OK;
 }
 

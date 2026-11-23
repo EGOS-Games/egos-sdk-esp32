@@ -15,6 +15,7 @@ set(srcs
     "src/egos_nvs.c"
     "src/egos_wifi.c"
     "src/egos_mqtt.c"
+    "src/egos_module_auth.c"   # module secrets: pure logic, host-tested
     "src/egos_discovery.c"
     "src/egos_settings.c"
     "src/egos_connection.c"

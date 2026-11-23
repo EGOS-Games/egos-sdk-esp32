@@ -267,6 +267,7 @@ All topics are relative to your module ID.
 | Subscribe | `{moduleId}/device/+/configuration/set` | 1 | Configuration JSON |
 | Subscribe | `{moduleId}/credentials/set` | 1 | `{"ssid":"...","password":"..."}` |
 | Subscribe | `{moduleId}/credentials/reset` | 1 | (empty) |
+| Subscribe | `{moduleId}/module/secret` | 1 | `{"secret":"<43 chars>","version":1}` |
 | Last Will | `client/disconnect` | 1 | `{"id":"...","status":"disconnected"}` |
 
 ## Connection Behavior
@@ -322,6 +323,37 @@ The EGOS controller can update module WiFi credentials over MQTT:
 - **Reset to defaults**: Controller publishes to `{moduleId}/credentials/reset`
 
 The module saves credentials to NVS and reboots. This allows deploying modules on the default EGOS network, then remotely switching them to a production WiFi network.
+
+### Module Secret (since 0.7.0)
+
+The controller gives each module a secret the first time it registers, and the
+module proves its client id with it from then on. Without it, anything on the
+venue LAN could connect with a module's id and receive that module's messages,
+including the venue WiFi password. The SDK does all of this itself; module code
+does not change. Protocol: "Module secrets (protocol v1)" in egos-controller
+`docs/LOCAL-AUTH.md`.
+
+- **Storage:** NVS namespace `egos_auth`, key `module_secret`, separate from the
+  WiFi credentials, so `credentials/reset` does not erase it.
+- **No secret yet:** connects with username `module` and no password, subscribes
+  to `{moduleId}/module/secret` before publishing `module/register`, and stores
+  the secret the controller sends back. It is used from the next connection.
+- **With a secret:** username `module`, password the secret.
+- **Refused with CONNACK 4** while sending a secret (someone pressed **Forget**
+  in the controller): the SDK deletes the secret and reconnects without one,
+  and the controller issues a new one.
+- **Refused with CONNACK 5** without a secret (the controller already has a
+  secret for this module id, e.g. after a reflash): the SDK keeps retrying,
+  shows the auth-error LED and logs, once a minute, that someone must press
+  **Forget** for this module in the controller's Settings > Paired devices.
+- The secret is never logged.
+- **Losing it:** a full flash erase, or `nvs_flash_init()` reporting
+  `NO_FREE_PAGES`/`NEW_VERSION_FOUND` (the SDK then erases the NVS partition),
+  loses the secret. The module then needs **Forget** in the controller.
+- **Controller version:** a controller from before local auth ignores the username.
+  One with local auth but without module secrets (egos-controller before PR #80)
+  logs username `module` as unknown in `log` mode and refuses it in `enforce`,
+  so update the controller before, or with, module firmware on this SDK.
 
 ## API Reference
 
@@ -387,6 +419,17 @@ The EGOS controller runs an MQTT broker (Aedes). Connect to it on port **1883**.
 
 **Your MQTT client ID must be your module ID.** The controller identifies modules by client ID.
 
+**Username and password (module secret).** Connect with username `module`. The
+first time, send no password: after `module/register` the controller sends a
+secret on `{moduleId}/module/secret` (subscribe to it before you register).
+Store it somewhere that survives reboots and send it as the password on every
+later connection. If a connection with your secret is refused with CONNACK 4,
+delete it and connect without one. If a connection without one is refused with
+CONNACK 5, the controller already has a secret for your id: someone must press
+**Forget** for the module in the controller's Settings > Paired devices. Never
+log the secret. Full rules: "Module secrets (protocol v1)" in egos-controller
+`docs/LOCAL-AUTH.md`.
+
 ### 2. Generate a Module ID
 
 Your module ID must be unique. The convention is `{type}-{identifier}`, e.g.:
@@ -444,6 +487,7 @@ Subscribe to receive commands from the controller:
 {moduleId}/device/+/configuration/set      — Configuration updates (QoS 1)
 {moduleId}/credentials/set                 — WiFi credential provisioning (QoS 1)
 {moduleId}/credentials/reset               — Reset credentials (QoS 1)
+{moduleId}/module/secret                   — Your module secret (QoS 1), before module/register
 ```
 
 The `+` is an MQTT single-level wildcard matching any device ID.
@@ -536,6 +580,7 @@ Clear saved credentials and revert to defaults.
 | Subscribe | `{moduleId}/device/+/configuration/set` | 1 | Config JSON |
 | Subscribe | `{moduleId}/credentials/set` | 1 | `{"ssid":"...","password":"..."}` |
 | Subscribe | `{moduleId}/credentials/reset` | 1 | (empty) |
+| Subscribe | `{moduleId}/module/secret` | 1 | `{"secret":"<43 chars>","version":1}` |
 | Last Will | `client/disconnect` | 1 | `{"id":"...","status":"disconnected"}` |
 
 ### Minimal Python Example

@@ -10,6 +10,7 @@
 #define EGOS_INTERNAL_H
 
 #include "egos_sdk.h"
+#include "egos_module_auth.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -140,6 +141,15 @@ esp_err_t egos_nvs_load_wifi_creds(char *ssid_buf, size_t ssid_len,
                                     char *pass_buf, size_t pass_len);
 esp_err_t egos_nvs_clear_wifi_creds(void);
 bool egos_nvs_has_wifi_creds(void);
+
+/* Module secret (protocol v1), NVS namespace "egos_auth", key "module_secret".
+ * Separate from the WiFi credentials, which credentials/reset erases.
+ * load returns ESP_ERR_NOT_FOUND when none is stored, ESP_ERR_INVALID_STATE
+ * when what is stored is malformed; buf is an empty string in both cases.
+ * buf_len must be at least EGOS_MODULE_SECRET_BUF_SIZE. */
+esp_err_t egos_nvs_save_module_secret(const char *secret);
+esp_err_t egos_nvs_load_module_secret(char *buf, size_t buf_len);
+esp_err_t egos_nvs_clear_module_secret(void);
 
 /* --------------------------------------------------------------------------
  * WiFi Module (egos_wifi.c)
